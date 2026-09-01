@@ -10,6 +10,8 @@ Two kinds of page are handled:
 Usage:
     python archive_page.py URL [output.pdf] [options]
     python archive_page.py --all [options]      # re-check every page already archived
+    python archive_page.py --fetch "<page title>" URL [URL ...]
+                                                # save linked files (reports, boards, memos) into that page's folder
 
 Options:
     --width=PX          layout width (default 1800; keep >= 1200 or the sidebar collapses)
@@ -18,6 +20,8 @@ Options:
                         instead of the default 2x JPEG screenshot (~0.8 MB)
     --force             write a PDF even when the text is identical to the previous capture
                         (default: unchanged pages are not re-exported)
+    --no-docs           don't auto-download the files in a PublicInput page's "Documents"
+                        list (default: they're saved into the page's folder with each new capture)
     --all               batch mode: every page with a capture under the output root (its URL
                         is read from the newest PDF's capture.json) is re-checked in turn
 
@@ -46,6 +50,7 @@ import time
 import warnings
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote
 
 from playwright.sync_api import sync_playwright
 import pikepdf
@@ -97,7 +102,15 @@ GENERIC_PREP_JS = """
   q('.ckeditor-accordion-container dt').forEach(d => d.classList.add('active'));   // Drupal accordions (austintexas.gov)
   q('.ckeditor-accordion-container dd').forEach(d => d.style.display = 'block');
   (""" + EXPAND_JS.strip() + """)(document.body);
-  for (const e of q('*')) { const s = getComputedStyle(e); if (s.position === 'fixed' || s.position === 'sticky') e.style.position = 'static'; }
+  // overlays (lightboxes, dialogs, cookie banners) must be hidden, not pinned into the flow
+  for (const e of q('[role="dialog"],[aria-modal="true"],.modal,.full-screen-modal,.ReactModalPortal,[class*="lightbox"],[class*="cookie"]')) e.style.display = 'none';
+  for (const e of q('*')) {
+    const s = getComputedStyle(e);
+    if (s.position !== 'fixed' && s.position !== 'sticky') continue;
+    if (e.style.display === 'none') continue;
+    if (s.visibility === 'hidden' || parseFloat(s.opacity) === 0) e.style.display = 'none';  // invisible overlays would become blank bands
+    else e.style.position = 'static';
+  }
   for (const e of q('[class*="userway"],.grecaptcha-badge,[class*="VIpgJd"],.asw-menu-btn,.asw-container')) e.style.display = 'none';
   if (iframeShots) q('iframe').forEach((f, i) => {
     if (!iframeShots[i]) return;
@@ -111,6 +124,21 @@ GENERIC_PREP_JS = """
     el.style.setProperty('height', 'auto', 'important');
   }
   return document.body.innerText;
+}
+"""
+
+LINKS_JS = """
+() => [...document.querySelectorAll('a[href]')]
+  .filter(a => /^https?:/.test(a.href) && !a.href.includes('#'))
+  .map(a => ({text: a.textContent.trim().slice(0, 120), href: a.href}))
+"""
+
+# Scroll through the page so lazy-loaded images and sections actually load.
+SCROLL_JS = """
+async () => {
+  const h = () => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+  for (let y = 0; y < h(); y += 800) { window.scrollTo(0, y); await new Promise(r => setTimeout(r, 200)); }
+  window.scrollTo(0, 0);
 }
 """
 
@@ -165,6 +193,10 @@ SNAP_JS = """
   if (!content) return -1;
   (""" + EXPAND_JS.strip() + """)(content);
   window.__piTexts.push(content.innerText);
+  window.__piLinks = window.__piLinks || [];
+  window.__piLinks.push([...content.querySelectorAll('a[href]')]
+    .filter(a => /^https?:/.test(a.href) && !a.href.includes('#'))
+    .map(a => ({text: a.textContent.trim().slice(0, 120), href: a.href})));
   const cl = content.cloneNode(true);
   const swap = (liveList, cloneList, srcFor) => {
     liveList.forEach((live, i) => {
@@ -241,6 +273,9 @@ def clean_lines(text):
     out = []
     for line in text.splitlines():
         line = line.strip()
+        # PublicInput appends its loading placeholder to the heading itself:
+        # "About the ProjectLoading About the Project" -> "About the Project"
+        line = re.sub(r"^(.*?)Loading \1$", r"\1", line)
         if not line or any(re.search(p, line) for p in NOISE_PATTERNS):
             continue
         out.append(line)
@@ -373,8 +408,10 @@ def detect_org(page, url, is_publicinput):
 
 
 def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
-            original_hero=False, force=False):
+            original_hero=False, force=False, fetch_docs=True):
     """Capture one page. Returns the written path, or None when unchanged."""
+    url = url.split("#")[0]   # a #tab-... fragment changes nothing (tabs are walked in nav order);
+                              # stripping it keeps the stored URL stable for change detection
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": width, "height": 1000},
@@ -387,7 +424,7 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
         safe_title = clean_title(title)
         is_publicinput = page.locator("section.project-content").count() > 0
         org = detect_org(page, url, is_publicinput)
-        stamp = datetime.now().strftime("%Y-%m-%d %H-%M")   # e.g. 2026-08-30 17-42
+        stamp = datetime.now().strftime("%Y-%m-%d %H%M")   # e.g. 2026-08-30 1742
         if explicit_out:
             out = Path(explicit_out).expanduser()
             out_dir = out.parent
@@ -463,8 +500,9 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
             print(f"  snapped [{idx+1}/{len(tab_ids)}] {name}" +
                   (f" ({len([s for s in shots if s])} embed(s) captured)" if shots else ""))
         # the record's text comes from the full pass too, so it matches the rendered pages
-        record["tabs"] = [{"name": nm, "text": tx}
-                          for nm, tx in zip(tab_names, page.evaluate("() => window.__piTexts"))]
+        record["tabs"] = [{"name": nm, "text": tx, "links": lk}
+                          for nm, tx, lk in zip(tab_names, page.evaluate("() => window.__piTexts"),
+                                                page.evaluate("() => window.__piLinks"))]
 
         # Phase B: rebuild the page linearly per tab, settle, measure, print.
         # Normally one page sized to the content; a tab taller than MAX_PAGE_PX
@@ -481,7 +519,19 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
                   (f" → {n_pages} pages" if n_pages > 1 else ""))
 
         browser.close()
-    return write_pdf(pdfs, page_labels, bookmarks, record, prev_path, diff_text, title, stamp, url, out)
+    result = write_pdf(pdfs, page_labels, bookmarks, record, prev_path, diff_text, title, stamp, url, out)
+    if result and fetch_docs:
+        # PublicInput's curated "Documents" list (sidebar on every tab): archive those
+        # files alongside the page. Identical files already in the folder are skipped.
+        docs = {}
+        for tab in record["tabs"]:
+            for link in tab.get("links", []):
+                if "/Customer/File/Full/" in link["href"]:
+                    docs.setdefault(link["href"], link["text"])
+        if docs:
+            print(f"Documents list: fetching {len(docs)} file(s)")
+            fetch_files(out_dir / "Attachments", [(u, n) for u, n in docs.items()])
+    return result
 
 
 def check_changes(record, out_dir, safe_title, out, force):
@@ -514,7 +564,10 @@ def archive_generic(page, browser, url, title, safe_title, stamp, out, out_dir, 
         return None
     page.reload(wait_until="load", timeout=60000)
     page.wait_for_timeout(SETTLE_MS * 2)
+    page.evaluate(SCROLL_JS)                 # trigger lazy-loaded images (StoryMaps, Drupal, …)
+    page.wait_for_timeout(SETTLE_MS)
     shots = screenshot_iframes(page, "iframe")
+    record["tabs"][0]["links"] = page.evaluate(LINKS_JS)
     record["tabs"][0]["text"] = page.evaluate(GENERIC_PREP_JS, shots)
     page.wait_for_timeout(800)
     buf, height_px, n_pages = print_page(page, width)
@@ -565,11 +618,50 @@ def write_pdf(pdfs, page_labels, bookmarks, record, prev_path, diff_text, title,
     return out
 
 
+def fetch_files(folder, items):
+    """Download linked documents into a capture folder. Items are URLs or
+    (url, preferred_name) pairs. Keeps the server's filename (else the preferred
+    name); an identical file already there is skipped, a different one with the
+    same name gets a date stamp. Runs through Chromium's request stack so
+    redirects, cookies and content-disposition behave like a browser download."""
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d %H%M")
+    with sync_playwright() as p:
+        req = p.request.new_context(user_agent="Mozilla/5.0 (Macintosh) archive_page.py")
+        for item in items:
+            url, preferred = item if isinstance(item, tuple) else (item, None)
+            try:
+                r = req.get(url, timeout=60000)
+                if not r.ok:
+                    print(f"  FAILED {url}: HTTP {r.status}")
+                    continue
+                cd = r.headers.get("content-disposition", "")
+                m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", cd)
+                name = (m.group(1) if m else preferred
+                        or url.split("?")[0].rstrip("/").split("/")[-1] or "download")
+                name = re.sub(r"[^\w.\- ()]+", "_", unquote(name))
+                data = r.body()
+                dest = folder / name
+                if dest.exists():
+                    if hashlib.sha256(dest.read_bytes()).hexdigest() == hashlib.sha256(data).hexdigest():
+                        print(f"  unchanged: {name}")
+                        continue
+                    stem, dot, ext = name.rpartition(".")
+                    dest = folder / (f"{stem} - {stamp}.{ext}" if dot else f"{name} - {stamp}")
+                dest.write_bytes(data)
+                print(f"  saved {dest.name} ({len(data)/1e6:.1f} MB) <- {url}")
+            except Exception as e:
+                print(f"  FAILED {url}: {e}")
+        req.dispose()
+
+
 def archived_urls(root):
     """URLs of every page already captured under root (newest PDF per folder,
     folders at any depth)."""
     urls = []
     for folder in sorted(p for p in root.rglob("*") if p.is_dir()):
+        if "attachments" in folder.name.lower():
+            continue
         pdfs = sorted(folder.glob("*.pdf"))
         if not pdfs:
             continue
@@ -594,7 +686,16 @@ def main():
             width = int(a.split("=", 1)[1])
         elif a.startswith("--out-dir="):
             out_dir = Path(a.split("=", 1)[1]).expanduser()
-    opts = dict(width=width, original_hero="--original-hero" in flags, force="--force" in flags)
+    opts = dict(width=width, original_hero="--original-hero" in flags, force="--force" in flags,
+                fetch_docs="--no-docs" not in flags)
+
+    if "--fetch" in flags:
+        if len(args) < 2:
+            sys.exit('usage: archive_page.py --fetch "<page title>" URL [URL ...]')
+        folder = (out_dir or ARCHIVE_ROOT) / args[0] / "Attachments"
+        print(f"Fetching {len(args) - 1} file(s) into {folder}")
+        fetch_files(folder, args[1:])
+        return
 
     if "--all" in flags:
         root = out_dir or ARCHIVE_ROOT

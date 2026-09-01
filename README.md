@@ -5,9 +5,10 @@ alternative to the Safari bookmarklets (see "PublicInput PDF Bookmarklet" and
 "AustinTexas.gov PDF Bookmarklet" in Archive - Changes Around Me/Tooling).
 
 - **PublicInput (Speak Up Austin) project pages** → one content-sized PDF page per tab.
-- **Any other page** (austintexas.gov project pages, etc.) → one content-sized PDF page,
-  with collapsed sections (Drupal accordions, Bootstrap collapse, `<details>`) expanded
-  and fixed headers pinned into the flow first.
+- **Any other page** (austintexas.gov project pages, ArcGIS StoryMaps, etc.) → one
+  content-sized PDF page: the page is scrolled through so lazy images load, collapsed
+  sections (Drupal accordions, Bootstrap collapse, `<details>`) are expanded, overlays are
+  hidden and fixed headers pinned into the flow first.
 
 The script decides which kind it's looking at by itself; the command is the same.
 
@@ -26,10 +27,13 @@ The script decides which kind it's looking at by itself; the command is the same
     .venv/bin/python archive_page.py <url> --original-hero     # keep the hero's source PNG (+~7 MB)
     .venv/bin/python archive_page.py <url> --force             # export even if nothing changed
     .venv/bin/python archive_page.py <url> --width=1440
+    .venv/bin/python archive_page.py <url> --no-docs           # skip auto-download of the Documents list
     .venv/bin/python archive_page.py --all                    # re-check every archived page; writes only what changed
+    .venv/bin/python archive_page.py --fetch "Central City District Plan" 'https://…/report.pdf' 'https://…/boards.pdf'
+                                                              # save linked files into that page's folder
 
 Every capture lands in `Archive - Changes Around Me/Tooling/Web Archive/<page title>/`,
-named `<page title> - <2026-08-30 17-42>.pdf` (export date + time) — one flat archive,
+named `<page title> - <2026-08-30 1742>.pdf` (export date + time) — one flat archive,
 whatever the site. The owning organization (PublicInput customer id → `PUBLICINPUT_ORGS`
 at the top of the script; hostname for other sites) and the source URL are recorded in each
 capture's metadata; organizing happens in the knowledge base, not in the folders.
@@ -49,12 +53,24 @@ the change check refuses to use the other page's capture as a baseline and says 
   videos) are captured as images of their on-screen state; the hero banner is
   a 2x JPEG stored once and shared by all pages.
 - Title metadata = page title + exact export time; source URL in metadata.
-- Embedded attachment `capture.json`: per-tab plain text captured at export
-  time. Not visible in Preview (Acrobat/PDF Expert show attachments) — it's
+- Embedded attachment `capture.json`: per-tab plain text and outbound links
+  (text + URL) captured at export time. Not visible in Preview (Acrobat/PDF Expert show attachments) — it's
   for change tracking, and a text record that survives independent of the
   PDF's text layer.
 - Embedded attachment `changes.diff` (only when something changed): unified
   diff against the previous capture in the same folder.
+
+## Linked files
+
+A PublicInput page's curated **Documents** list (the sidebar file list) is archived
+automatically: each new capture also downloads those files into the page's
+`Attachments/` subfolder, skipping ones already there unchanged (`--no-docs` turns
+this off). For everything else the archive captures pages, not the documents they
+link to. `--fetch` saves chosen links (reports, open-house boards, memos, feedback
+summaries) into the same `Attachments/` subfolder, keeping the server's filename;
+a file already there and identical is skipped, a changed one gets a date stamp. Choosing which links matter is the job of the
+`cam-archive-review` skill, which reads each capture's links and `changes.diff` and
+proposes a shortlist — nothing is downloaded until you run the command it gives you.
 
 ## Change tracking
 
