@@ -13,8 +13,7 @@ Usage:
 
 Options:
     --width=PX          layout width (default 1800; keep >= 1200 or the sidebar collapses)
-    --out-dir=DIR       where captures go (default: Archive vault, Tooling/Public Input Export/<title>/
-                        for PublicInput pages, Tooling/Website Export/<title>/ for others)
+    --out-dir=DIR       where captures go (default: Archive vault, Tooling/Web Archive/<page title>/)
     --original-hero     keep the hero banner's source image (lossless, ~7 MB once)
                         instead of the default 2x JPEG screenshot (~0.8 MB)
     --force             write a PDF even when the text is identical to the previous capture
@@ -54,17 +53,23 @@ import pikepdf
 PAGE_WIDTH_PX = 1800          # layout width; keep >=1200 or the sidebar column collapses. ~1800 matches Ian's Safari exports
 PX_PER_IN = 96
 SETTLE_MS = 1800              # wait after tab content arrives (images, charts, embeds) — full capture
-QUICK_SETTLE_MS = 300         # wait before reading a tab's text in the change-check pass
+QUICK_SETTLE_MS = 300         # polling interval while waiting for a tab's text to stop changing (change-check pass)
 TAB_TIMEOUT_MS = 12000
 HERO_JPEG_QUALITY = 90        # hero banner is captured once at 2x (Retina) and shared by all pages
 MAX_PAGE_PX = 0               # 0 = one page per tab regardless of height (Preview is fine with very tall pages).
                               # Set to e.g. 18000 to split taller tabs onto continuation pages (Acrobat caps pages at 200in = 19200px).
 ARCHIVE_TOOLING = (Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents"
                    / "Archive - Changes Around Me/Tooling")
-PUBLICINPUT_ROOT = ARCHIVE_TOOLING / "Public Input Export"
-GENERIC_ROOT = ARCHIVE_TOOLING / "Website Export"
+ARCHIVE_ROOT = ARCHIVE_TOOLING / "Web Archive"     # every page: <root>/<page title>/<title> - <stamp>.pdf
+# PublicInput customer ids -> organization name, recorded in each capture's
+# metadata (the archive itself stays flat — organizing happens in the KB).
+PUBLICINPUT_ORGS = {
+    "110": "City of Austin",
+    "2658": "CapMetro",
+}
 # Lines matching these are ignored when diffing (dynamic UI noise, not content changes)
 NOISE_PATTERNS = [
+    r"^Loading\b.*$",                  # "Loading Comments" etc. — placeholders the quick pass can catch mid-load
     r"^\d+ characters remaining$",
     r"^\d+ (comments?|responses?|participants?)$",
     r"\b\d+ (seconds?|minutes?|hours?|days?) ago\b",
@@ -242,15 +247,21 @@ def clean_lines(text):
     return out
 
 
-def previous_capture(out_dir, safe_title, current_path):
-    """Most recent earlier PDF for this page that carries a capture.json."""
+def previous_capture(out_dir, safe_title, current_path, url=None):
+    """Most recent earlier PDF for this page that carries a capture.json.
+    A capture of a different URL (two pages sharing a title in the flat
+    archive) is never used as the baseline."""
     candidates = sorted(p for p in out_dir.glob(f"{safe_title} - *.pdf") if p != current_path)
     for path in reversed(candidates):
         try:
             with pikepdf.open(path) as pdf:
                 if "capture.json" in pdf.attachments:
-                    data = pdf.attachments["capture.json"].get_file().read_bytes()
-                    return path, json.loads(data)
+                    data = json.loads(pdf.attachments["capture.json"].get_file().read_bytes())
+                    if url and data.get("url") not in (None, url):
+                        print(f"  WARNING: {path.name} is a capture of a different page ({data.get('url')}) — "
+                              f"not used as baseline; consider --out-dir to keep them apart")
+                        continue
+                    return path, data
         except Exception as e:  # unreadable/odd file: skip it, keep looking
             print(f"  (skipping {path.name}: {e})")
     return None, None
@@ -296,6 +307,25 @@ def diff_captures(prev, cur):
     return summary, "\n\n".join(chunks)
 
 
+def settled_text(page):
+    """The tab's text once it has stopped changing: two reads QUICK_SETTLE_MS apart
+    agree and no 'Loading…' placeholder remains (capped at 2×SETTLE_MS). Static
+    tabs finish in two reads; tabs still fetching comment widgets wait as long
+    as they need, so the check sees the same state the full capture will store."""
+    deadline = time.time() + 2 * SETTLE_MS / 1000
+    last = None
+    while True:
+        page.wait_for_timeout(QUICK_SETTLE_MS)
+        text = page.evaluate(TEXT_JS)
+        if text is None:
+            return None
+        if text == last and not re.search(r"^Loading\b", text, re.M):
+            return text
+        if time.time() > deadline:
+            return text
+        last = text
+
+
 def clean_title(title):
     """'Sir Swante Palm ... | Austin Parks | AustinTexas.gov' -> 'Sir Swante Palm ...';
     'Central City District Plan - PublicInput' -> 'Central City District Plan'."""
@@ -333,6 +363,15 @@ def print_page(page, width):
     return buf, height_px, n_pages
 
 
+def detect_org(page, url, is_publicinput):
+    """Organization for the capture metadata: PublicInput customer id lookup, else hostname."""
+    if is_publicinput:
+        m = re.search(r"custId[\"'=:\s]+(\d+)", page.content())
+        cust = m.group(1) if m else None
+        return PUBLICINPUT_ORGS.get(cust, f"PublicInput customer {cust or 'unknown'}")
+    return re.sub(r"^www\.", "", url.split("/")[2])
+
+
 def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
             original_hero=False, force=False):
     """Capture one page. Returns the written path, or None when unchanged."""
@@ -347,17 +386,18 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
         title = page.title()
         safe_title = clean_title(title)
         is_publicinput = page.locator("section.project-content").count() > 0
+        org = detect_org(page, url, is_publicinput)
         stamp = datetime.now().strftime("%Y-%m-%d %H-%M")   # e.g. 2026-08-30 17-42
         if explicit_out:
             out = Path(explicit_out).expanduser()
             out_dir = out.parent
         else:
-            out_dir = out_dir or ((PUBLICINPUT_ROOT if is_publicinput else GENERIC_ROOT) / safe_title)
+            out_dir = out_dir or (ARCHIVE_ROOT / safe_title)
             out = out_dir / f"{safe_title} - {stamp}.pdf"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         if not is_publicinput:
-            return archive_generic(page, browser, url, title, safe_title, stamp, out, out_dir, width, force)
+            return archive_generic(page, browser, url, title, safe_title, stamp, out, out_dir, width, force, org)
 
         labels = page.locator('a.nav-link[id^="tab-label-"]')
         n = labels.count()
@@ -390,12 +430,11 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
         for tid in tab_ids:
             if tid is not None:
                 goto_tab(tid)
-            page.wait_for_timeout(QUICK_SETTLE_MS)
-            text = page.evaluate(TEXT_JS)
+            text = settled_text(page)
             if text is None:
                 sys.exit("No section.project-content found — is this a PublicInput page?")
             texts.append(text)
-        record = {"title": title, "url": url, "exported": stamp, "width": width,
+        record = {"title": title, "url": url, "org": org, "exported": stamp, "width": width,
                   "tabs": [{"name": nm, "text": tx} for nm, tx in zip(tab_names, texts)]}
 
         prev_path, diff_text, proceed = check_changes(record, out_dir, safe_title, out, force)
@@ -447,7 +486,7 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
 
 def check_changes(record, out_dir, safe_title, out, force):
     """Compare with the previous capture. Returns (prev_path, diff_text, proceed)."""
-    prev_path, prev = previous_capture(out_dir, safe_title, out)
+    prev_path, prev = previous_capture(out_dir, safe_title, out, record.get("url"))
     diff_text = ""
     if prev:
         summary, diff_text = diff_captures(prev, record)
@@ -463,11 +502,11 @@ def check_changes(record, out_dir, safe_title, out, force):
     return prev_path, diff_text, True
 
 
-def archive_generic(page, browser, url, title, safe_title, stamp, out, out_dir, width, force):
+def archive_generic(page, browser, url, title, safe_title, stamp, out, out_dir, width, force, org):
     """Non-PublicInput page: expand, un-fix, print the live document as one page."""
     print(f"{title}: single page")
     text = page.evaluate(GENERIC_PREP_JS, None)
-    record = {"title": title, "url": url, "exported": stamp, "width": width,
+    record = {"title": title, "url": url, "org": org, "exported": stamp, "width": width,
               "tabs": [{"name": safe_title, "text": text}]}
     prev_path, diff_text, proceed = check_changes(record, out_dir, safe_title, out, force)
     if not proceed:
@@ -527,9 +566,10 @@ def write_pdf(pdfs, page_labels, bookmarks, record, prev_path, diff_text, title,
 
 
 def archived_urls(root):
-    """URLs of every page already captured under root (newest PDF per folder)."""
+    """URLs of every page already captured under root (newest PDF per folder,
+    folders at any depth)."""
     urls = []
-    for folder in sorted(p for p in root.iterdir() if p.is_dir()):
+    for folder in sorted(p for p in root.rglob("*") if p.is_dir()):
         pdfs = sorted(folder.glob("*.pdf"))
         if not pdfs:
             continue
@@ -557,8 +597,8 @@ def main():
     opts = dict(width=width, original_hero="--original-hero" in flags, force="--force" in flags)
 
     if "--all" in flags:
-        roots = [out_dir] if out_dir else [PUBLICINPUT_ROOT, GENERIC_ROOT]
-        urls = [u for r in roots if r.exists() for u in archived_urls(r)]
+        root = out_dir or ARCHIVE_ROOT
+        urls = archived_urls(root) if root.exists() else []
         print(f"Re-checking {len(urls)} archived page(s)\n")
         written, failed = [], []
         for url in urls:

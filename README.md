@@ -28,10 +28,13 @@ The script decides which kind it's looking at by itself; the command is the same
     .venv/bin/python archive_page.py <url> --width=1440
     .venv/bin/python archive_page.py --all                    # re-check every archived page; writes only what changed
 
-Captures land in `Archive - Changes Around Me/Tooling/Public Input Export/<page title>/`
-(PublicInput pages) or `Tooling/Website Export/<page title>/` (everything else) by default,
-named `<page title> - <2026-08-30 17-42>.pdf` (export date + time). `--all` re-checks
-every page under both.
+Every capture lands in `Archive - Changes Around Me/Tooling/Web Archive/<page title>/`,
+named `<page title> - <2026-08-30 17-42>.pdf` (export date + time) — one flat archive,
+whatever the site. The owning organization (PublicInput customer id → `PUBLICINPUT_ORGS`
+at the top of the script; hostname for other sites) and the source URL are recorded in each
+capture's metadata; organizing happens in the knowledge base, not in the folders.
+`--all` re-checks every page under the root. If two different pages ever share a title,
+the change check refuses to use the other page's capture as a baseline and says so.
 
 ## What's in each PDF
 
@@ -56,7 +59,8 @@ every page under both.
 ## Change tracking
 
 Each run first does a quick text-only walk of the tabs (no image settling or
-screenshots), compares it with the most recent earlier PDF's `capture.json`,
+screenshots; each tab is read until its text stops changing and no "Loading…"
+placeholder remains), compares it with the most recent earlier PDF's `capture.json`,
 and prints a per-tab summary plus the diff. **If nothing changed, no new PDF is
 written** (pass `--force` to export anyway); only a changed page pays for the
 full capture. Renamed tabs are paired by position and reported as
