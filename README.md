@@ -75,9 +75,15 @@ proposes a shortlist — nothing is downloaded until you run the command it give
 ## Change tracking
 
 Each run first does a quick text-only walk of the tabs (no image settling or
-screenshots; each tab is read until its text stops changing and no "Loading…"
-placeholder remains), compares it with the most recent earlier PDF's `capture.json`,
-and prints a per-tab summary plus the diff. **If nothing changed, no new PDF is
+screenshots; each tab is read until its text stops changing, no "Loading…"
+placeholder remains, and no AJAX request is still in flight — a slow tab's
+pending request would otherwise let leftover content pass for settled),
+compares it with the most recent earlier PDF's `capture.json`,
+and prints a per-tab summary plus the diff (a diff longer than
+`MAX_DIFF_PRINT_LINES` is truncated in the log — the full diff is always embedded
+in the new PDF as `changes.diff`). After the full capture, the diff is recomputed
+from what will actually be stored: if the full capture turns out identical to the
+previous one (the quick check misread a still-loading tab), nothing is written. **If nothing changed, no new PDF is
 written** (pass `--force` to export anyway); only a changed page pays for the
 full capture. Renamed tabs are paired by position and reported as
 `Old → New (renamed)`; a genuinely new or removed tab counts as a change.

@@ -63,6 +63,7 @@ TAB_TIMEOUT_MS = 12000
 HERO_JPEG_QUALITY = 90        # hero banner is captured once at 2x (Retina) and shared by all pages
 MAX_PAGE_PX = 0               # 0 = one page per tab regardless of height (Preview is fine with very tall pages).
                               # Set to e.g. 18000 to split taller tabs onto continuation pages (Acrobat caps pages at 200in = 19200px).
+MAX_DIFF_PRINT_LINES = 40     # a longer diff is truncated in the log; the full diff is always embedded as changes.diff
 ARCHIVE_TOOLING = (Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents"
                    / "Archive - Changes Around Me/Tooling")
 ARCHIVE_ROOT = ARCHIVE_TOOLING / "Web Archive"     # every page: <root>/<page title>/<title> - <stamp>.pdf
@@ -344,17 +345,22 @@ def diff_captures(prev, cur):
 
 def settled_text(page):
     """The tab's text once it has stopped changing: two reads QUICK_SETTLE_MS apart
-    agree and no 'Loading…' placeholder remains (capped at 2×SETTLE_MS). Static
-    tabs finish in two reads; tabs still fetching comment widgets wait as long
-    as they need, so the check sees the same state the full capture will store."""
-    deadline = time.time() + 2 * SETTLE_MS / 1000
+    agree, no 'Loading…' placeholder remains, and no AJAX request is in flight
+    (capped at TAB_TIMEOUT_MS). The in-flight check matters: PublicInput swaps tab
+    content via jQuery, and while a slow tab's request is still pending the section
+    shows a perfectly stable leftover (placeholder heading + sidebar) that would
+    otherwise pass for settled — and the late response can then land while the NEXT
+    tab is being read, crediting one tab's text to another. Static tabs still
+    finish in two reads."""
+    deadline = time.time() + TAB_TIMEOUT_MS / 1000
     last = None
     while True:
         page.wait_for_timeout(QUICK_SETTLE_MS)
         text = page.evaluate(TEXT_JS)
         if text is None:
             return None
-        if text == last and not re.search(r"^Loading\b", text, re.M):
+        busy = page.evaluate("() => window.jQuery ? jQuery.active : 0")
+        if text == last and not busy and not re.search(r"^Loading\b", text, re.M):
             return text
         if time.time() > deadline:
             return text
@@ -458,7 +464,8 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
                 page.wait_for_timeout(300)
                 now = page.evaluate(
                     "() => (document.querySelector('section.project-content')||{innerHTML:''}).innerHTML")
-                if now != before:
+                busy = page.evaluate("() => window.jQuery ? jQuery.active : 0")
+                if now != before and not busy:   # content swapped AND no request still in flight
                     return
 
         # Quick pass: text only, short settle, no screenshots — enough to decide
@@ -474,9 +481,11 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
         record = {"title": title, "url": url, "org": org, "exported": stamp, "width": width,
                   "tabs": [{"name": nm, "text": tx} for nm, tx in zip(tab_names, texts)]}
 
-        prev_path, diff_text, proceed = check_changes(record, out_dir, safe_title, out, force)
+        prev_path, prev, diff_text, proceed = check_changes(record, out_dir, safe_title, out, force)
         if not proceed:
             browser.close()
+            if fetch_docs and prev:
+                fetch_missing_docs(out_dir, prev)
             return None
 
         # Full pass: reload for a clean DOM, then visit every tab and snapshot it
@@ -504,6 +513,22 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
                           for nm, tx, lk in zip(tab_names, page.evaluate("() => window.__piTexts"),
                                                 page.evaluate("() => window.__piLinks"))]
 
+        # Re-diff against the FULL capture: the embedded changes.diff must describe
+        # what capture.json actually stores. If the quick pass misread a tab (e.g. a
+        # slow AJAX response) but the full capture matches the previous one, the
+        # "change" was a mirage — skip the export unless --force.
+        if prev:
+            _, diff_text = diff_captures(prev, record)
+            if not diff_text:
+                print("Full capture matches the previous one after all — the quick "
+                      "check misread a still-loading tab.")
+                if not force:
+                    print("Nothing written (use --force to export anyway).")
+                    browser.close()
+                    if fetch_docs:
+                        fetch_missing_docs(out_dir, prev)
+                    return None
+
         # Phase B: rebuild the page linearly per tab, settle, measure, print.
         # Normally one page sized to the content; a tab taller than MAX_PAGE_PX
         # is printed at that height and flows onto continuation pages.
@@ -523,11 +548,7 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
     if result and fetch_docs:
         # PublicInput's curated "Documents" list (sidebar on every tab): archive those
         # files alongside the page. Identical files already in the folder are skipped.
-        docs = {}
-        for tab in record["tabs"]:
-            for link in tab.get("links", []):
-                if "/Customer/File/Full/" in link["href"]:
-                    docs.setdefault(link["href"], link["text"])
+        docs = documents_from(record)
         if docs:
             print(f"Documents list: fetching {len(docs)} file(s)")
             fetch_files(out_dir / "Attachments", [(u, n) for u, n in docs.items()])
@@ -535,7 +556,7 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
 
 
 def check_changes(record, out_dir, safe_title, out, force):
-    """Compare with the previous capture. Returns (prev_path, diff_text, proceed)."""
+    """Compare with the previous capture. Returns (prev_path, prev, diff_text, proceed)."""
     prev_path, prev = previous_capture(out_dir, safe_title, out, record.get("url"))
     diff_text = ""
     if prev:
@@ -543,13 +564,40 @@ def check_changes(record, out_dir, safe_title, out, force):
         print(f"Changes since {prev_path.name}:")
         print("\n".join(summary))
         if diff_text:
-            print(diff_text)
+            lines = diff_text.splitlines()
+            if len(lines) > MAX_DIFF_PRINT_LINES:
+                print("\n".join(lines[:MAX_DIFF_PRINT_LINES]))
+                print(f"… ({len(lines) - MAX_DIFF_PRINT_LINES} more lines — "
+                      "full diff embedded in the new PDF as changes.diff)")
+            else:
+                print(diff_text)
         elif not force:
             print("No changes since previous capture — nothing written (use --force to export anyway).")
-            return prev_path, diff_text, False
+            return prev_path, prev, diff_text, False
     else:
         print("No previous capture with embedded text found in", out_dir)
-    return prev_path, diff_text, True
+    return prev_path, prev, diff_text, True
+
+
+def documents_from(record):
+    """{href: filename} of the PublicInput Documents-list files a capture recorded."""
+    docs = {}
+    for tab in record.get("tabs", []):
+        for link in tab.get("links", []):
+            if "/Customer/File/Full/" in link["href"]:
+                docs.setdefault(link["href"], link["text"])
+    return docs
+
+
+def fetch_missing_docs(out_dir, record):
+    """Top up Attachments/ with Documents-list files not yet on disk (by name).
+    Used on unchanged pages so a backfill doesn't require a re-export."""
+    att = out_dir / "Attachments"
+    missing = [(u, n) for u, n in documents_from(record).items()
+               if not (att / re.sub(r"[^\w.\- ()]+", "_", unquote(n))).exists()]
+    if missing:
+        print(f"Documents list: fetching {len(missing)} missing file(s)")
+        fetch_files(att, missing)
 
 
 def archive_generic(page, browser, url, title, safe_title, stamp, out, out_dir, width, force, org):
@@ -558,7 +606,7 @@ def archive_generic(page, browser, url, title, safe_title, stamp, out, out_dir, 
     text = page.evaluate(GENERIC_PREP_JS, None)
     record = {"title": title, "url": url, "org": org, "exported": stamp, "width": width,
               "tabs": [{"name": safe_title, "text": text}]}
-    prev_path, diff_text, proceed = check_changes(record, out_dir, safe_title, out, force)
+    prev_path, prev, diff_text, proceed = check_changes(record, out_dir, safe_title, out, force)
     if not proceed:
         browser.close()
         return None
