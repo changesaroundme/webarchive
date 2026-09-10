@@ -5,10 +5,21 @@ alternative to the Safari bookmarklets (see "PublicInput PDF Bookmarklet" and
 "AustinTexas.gov PDF Bookmarklet" in Archive - Changes Around Me/Tooling).
 
 - **PublicInput (Speak Up Austin) project pages** → one content-sized PDF page per tab.
-- **Any other page** (austintexas.gov project pages, ArcGIS StoryMaps, etc.) → one
+- **PublicInput survey pages** (a "Page 1..N" workflow gated behind required questions,
+  e.g. publicinput.com/x30854) → one PDF page per survey page. Nothing is answered or
+  submitted: the gate is client-side only, so each step is fetched directly from the
+  server and captured blank, with Continue/Back buttons hidden.
+- **ArcGIS StoryMaps** are captured via the story's own `/print` rendition (full
+  content in document order — the interactive scrollytelling view prints scrambled);
+  map canvases are screenshotted like iframes. The capture is still filed under the
+  story's normal URL.
+- **Any other page** (austintexas.gov project pages, etc.) → one
   content-sized PDF page: the page is scrolled through so lazy images load, collapsed
-  sections (Drupal accordions, Bootstrap collapse, `<details>`) are expanded, overlays are
-  hidden and fixed headers pinned into the flow first.
+  sections (Drupal accordions, Bootstrap collapse, ARIA accordions like TxDOT's
+  one-panel-at-a-time "melodeon", `<details>`) are expanded, overlays are hidden, fixed
+  headers pinned into the flow, and viewport-sized sections (StoryMaps' 100vh covers)
+  frozen at their on-screen height so they can't re-inflate to the full page height
+  during printing.
 
 The script decides which kind it's looking at by itself; the command is the same.
 
@@ -67,7 +78,12 @@ automatically: each new capture also downloads those files into the page's
 `Attachments/` subfolder, skipping ones already there unchanged (`--no-docs` turns
 this off). For everything else the archive captures pages, not the documents they
 link to. `--fetch` saves chosen links (reports, open-house boards, memos, feedback
-summaries) into the same `Attachments/` subfolder, keeping the server's filename;
+summaries) into the same `Attachments/` subfolder, keeping the server's filename.
+Embedded iframes (Google Drive previews, YouTube, maps) are recorded in each
+capture's links as `[embedded]` entries, and Google Drive links in any form
+(`file/d/…`, `/preview` embeds, `open?id=…`) are converted to direct downloads —
+so an embedded Drive presentation can be fetched with `--fetch` using the URL
+straight from `capture.json`;
 a file already there and identical is skipped, a changed one gets a date stamp. Choosing which links matter is the job of the
 `cam-archive-review` skill, which reads each capture's links and `changes.diff` and
 proposes a shortlist — nothing is downloaded until you run the command it gives you.

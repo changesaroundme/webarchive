@@ -88,11 +88,51 @@ EXPAND_JS = """
   for (const e of content.querySelectorAll('.collapse:not(.show)')) { e.classList.add('show', 'in'); e.style.height = 'auto'; }
   for (const t of content.querySelectorAll('.collapsed')) t.classList.remove('collapsed');
   for (const d of content.querySelectorAll('details')) d.open = true;
+  // ARIA accordions (e.g. TxDOT's AEM "melodeon", which allows only one open panel
+  // at a time — so panels are forced open structurally, never by clicking):
+  for (const b of content.querySelectorAll('[class*="accordion"] [aria-expanded="false"], [data-melodeon-btn][aria-expanded="false"]')) {
+    b.setAttribute('aria-expanded', 'true');
+    const p = (b.getAttribute('aria-controls') && document.getElementById(b.getAttribute('aria-controls'))) || b.nextElementSibling;
+    if (!p) continue;
+    p.hidden = false;
+    p.style.setProperty('display', 'block', 'important');
+    p.style.setProperty('max-height', 'none', 'important');
+    p.style.setProperty('opacity', '1', 'important');
+    // the site's own open animation would also fade the content in — force that end
+    // state, or the panel prints as reserved-but-blank space (TxDOT's .acc-panel-inner)
+    for (const el of p.querySelectorAll('*')) {
+      const cs = getComputedStyle(el);
+      if (parseFloat(cs.opacity) === 0) el.style.setProperty('opacity', '1', 'important');
+      if (cs.visibility === 'hidden') el.style.setProperty('visibility', 'visible', 'important');
+      if (cs.maxHeight === '0px') el.style.setProperty('max-height', 'none', 'important');
+    }
+  }
 }
 """
 
 # Change-check pass: just the tab's visible text (after expansion), or null.
 TEXT_JS = "() => { const c = document.querySelector('section.project-content'); if (!c) return null; (" + EXPAND_JS.strip() + ")(c); return c.innerText; }"
+
+# Survey pages: the "answer required questions before continuing" gate is purely
+# client-side — POST /Project/LiveStep returns any step on request, unanswered.
+# Fetch step i and swap it into the step container, hiding the survey chrome.
+LOAD_STEP_JS = """
+async (i) => {
+  const UI = (window.PageUIObjects || [])[0];
+  if (!UI || !UI.config) return 'no PageUIObjects[0].config - has PublicInput changed?';
+  const postData = Object.assign({loadStepIndex: i, currentStepIndex: 0, performingSkip: false,
+                                  isMeetingSignIn: false}, UI.config);
+  const data = await new Promise((res) => jQuery.post('/Project/LiveStep', postData)
+    .done(res).fail(x => res({result: 'HTTP ' + x.status})));
+  const box = document.getElementById('surveyStepContent');
+  if (!box) return 'no #surveyStepContent';
+  if (data.html) box.innerHTML = data.html;
+  else box.innerHTML = '<p>(survey step ' + (i + 1) + ' returned no content: ' + (data.result || '?') + ')</p>';
+  for (const b of document.querySelectorAll('.step-continue-button, .step-back-button, .errorField'))
+    b.style.display = 'none';
+  return data.html ? 'SUCCESS' : (data.result || 'EMPTY');
+}
+"""
 
 # Generic pages: expand everything collapsed, pin fixed/sticky chrome into the
 # flow, hide floating widgets. Returns the page text. Used for the change check
@@ -112,8 +152,22 @@ GENERIC_PREP_JS = """
     if (s.visibility === 'hidden' || parseFloat(s.opacity) === 0) e.style.display = 'none';  // invisible overlays would become blank bands
     else e.style.position = 'static';
   }
-  for (const e of q('[class*="userway"],.grecaptcha-badge,[class*="VIpgJd"],.asw-menu-btn,.asw-container')) e.style.display = 'none';
-  if (iframeShots) q('iframe').forEach((f, i) => {
+  // Freeze viewport-relative heights: in page.pdf() the CSS viewport is the PAGE,
+  // so a 100vh cover section (StoryMaps etc.) would re-inflate to the full page
+  // height and push everything else off the single page. Pin anything roughly
+  // viewport-sized to the pixel height it has on screen right now.
+  const vh = window.innerHeight;
+  for (const e of q('*')) {
+    if (e === document.documentElement || e === document.body) continue;
+    const oh = e.offsetHeight;
+    if (oh < vh * 0.5 || oh > vh * 3.05) continue;
+    if (getComputedStyle(e).display === 'inline') continue;
+    e.style.setProperty('height', oh + 'px', 'important');
+    e.style.setProperty('min-height', '0', 'important');
+    e.style.setProperty('max-height', 'none', 'important');
+  }
+  for (const e of q('[class*="userway"],.grecaptcha-badge,[class*="VIpgJd"],.asw-menu-btn,.asw-container,[class*="print-wrapper"]')) e.style.display = 'none';
+  if (iframeShots) q('iframe, canvas').forEach((f, i) => {   // canvases too: WebGL maps print blank
     if (!iframeShots[i]) return;
     const m = document.createElement('img');
     m.src = 'data:image/png;base64,' + iframeShots[i];
@@ -132,13 +186,16 @@ LINKS_JS = """
 () => [...document.querySelectorAll('a[href]')]
   .filter(a => /^https?:/.test(a.href) && !a.href.includes('#'))
   .map(a => ({text: a.textContent.trim().slice(0, 120), href: a.href}))
+  .concat([...document.querySelectorAll('iframe[src], embed[src], object[data]')]
+    .map(f => f.src || f.data).filter(s => /^https?:/.test(s))
+    .map(s => ({text: '[embedded]', href: s})))
 """
 
 # Scroll through the page so lazy-loaded images and sections actually load.
 SCROLL_JS = """
 async () => {
   const h = () => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-  for (let y = 0; y < h(); y += 800) { window.scrollTo(0, y); await new Promise(r => setTimeout(r, 200)); }
+  for (let y = 0; y < h(); y += 800) { window.scrollTo(0, y); await new Promise(r => setTimeout(r, 350)); }
   window.scrollTo(0, 0);
 }
 """
@@ -197,7 +254,10 @@ SNAP_JS = """
   window.__piLinks = window.__piLinks || [];
   window.__piLinks.push([...content.querySelectorAll('a[href]')]
     .filter(a => /^https?:/.test(a.href) && !a.href.includes('#'))
-    .map(a => ({text: a.textContent.trim().slice(0, 120), href: a.href})));
+    .map(a => ({text: a.textContent.trim().slice(0, 120), href: a.href}))
+    .concat([...content.querySelectorAll('iframe[src], embed[src], object[data]')]
+      .map(f => f.src || f.data).filter(s => /^https?:/.test(s))
+      .map(s => ({text: '[embedded]', href: s}))));   // Drive/YouTube embeds are content too — record them
   const cl = content.cloneNode(true);
   const swap = (liveList, cloneList, srcFor) => {
     liveList.forEach((live, i) => {
@@ -371,8 +431,9 @@ def clean_title(title):
     """'Sir Swante Palm ... | Austin Parks | AustinTexas.gov' -> 'Sir Swante Palm ...';
     'Central City District Plan - PublicInput' -> 'Central City District Plan'."""
     t = title.split(" | ")[0]
-    t = re.sub(r"\s*-\s*PublicInput$", "", t)
-    return re.sub(r"[^\w\- ]+", "", t).strip() or "page"
+    t = re.sub(r"\s*-\s*(PublicInput|Austin Transit Partnership)$", "", t)
+    t = re.sub(r"[^\w\- ]+", "", t)
+    return re.sub(r"\s+", " ", t).strip() or "page"
 
 
 def screenshot_iframes(page, selector):
@@ -418,12 +479,19 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
     """Capture one page. Returns the written path, or None when unchanged."""
     url = url.split("#")[0]   # a #tab-... fragment changes nothing (tabs are walked in nav order);
                               # stripping it keeps the stored URL stable for change detection
+    nav_url = url
+    m = re.match(r"(https://storymaps\.arcgis\.com/stories/[A-Za-z0-9]+)/?$", url)
+    if m:
+        # StoryMaps' own linear print rendition: full content in document order, no
+        # scrollytelling virtualization (the interactive view prints scrambled).
+        # The record keeps the story's normal URL.
+        nav_url = m.group(1) + "/print"
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": width, "height": 1000},
                                 device_scale_factor=2)  # iframe screenshots at 2x so map embeds stay crisp
         page.emulate_media(media="screen")   # site's @media print styles hide the sidebar
-        page.goto(url, wait_until="load", timeout=60000)
+        page.goto(nav_url, wait_until="load", timeout=60000)
         page.wait_for_timeout(SETTLE_MS * 2)
 
         title = page.title()
@@ -448,7 +516,11 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
         tab_names = [labels.nth(i).inner_text().strip() for i in range(n)]
         if n == 0:
             tab_ids, tab_names = [None], [safe_title]
-        print(f"{title}: PublicInput page, {len(tab_ids)} tab(s)")
+        # Survey pages ("Page 1..N" tabs gated behind required questions) keep their
+        # step content in #surveyStepContent; steps are fetched server-side instead
+        # of clicked (the gate is client-side only — /Project/LiveStep returns any step).
+        is_survey = page.evaluate("() => !!document.getElementById('surveyStepContent')")
+        print(f"{title}: PublicInput {'survey, ' + str(len(tab_ids)) + ' page(s)' if is_survey else 'page, ' + str(len(tab_ids)) + ' tab(s)'}")
 
         def goto_tab(tid):
             """Click a tab and wait until its content has replaced the previous tab's."""
@@ -468,11 +540,19 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
                 if now != before and not busy:   # content swapped AND no request still in flight
                     return
 
+        def goto_step(idx):
+            """Load survey step idx into #surveyStepContent via /Project/LiveStep."""
+            res = page.evaluate(LOAD_STEP_JS, idx)
+            if res != "SUCCESS":
+                print(f"  step {idx + 1}: LiveStep returned {res}")
+
         # Quick pass: text only, short settle, no screenshots — enough to decide
         # whether anything changed. Only a changed page pays for the full capture.
         texts = []
-        for tid in tab_ids:
-            if tid is not None:
+        for idx, tid in enumerate(tab_ids):
+            if is_survey:
+                goto_step(idx)
+            elif tid is not None:
                 goto_tab(tid)
             text = settled_text(page)
             if text is None:
@@ -493,7 +573,9 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
         page.reload(wait_until="load", timeout=60000)
         page.wait_for_timeout(SETTLE_MS * 2)
         for idx, (tid, name) in enumerate(zip(tab_ids, tab_names)):
-            if tid is not None:
+            if is_survey:
+                goto_step(idx)
+            elif tid is not None:
                 goto_tab(tid)
             page.wait_for_timeout(SETTLE_MS)
             shots = screenshot_iframes(page, "section.project-content iframe")   # map/video embeds as seen on screen
@@ -614,9 +696,18 @@ def archive_generic(page, browser, url, title, safe_title, stamp, out, out_dir, 
     page.wait_for_timeout(SETTLE_MS * 2)
     page.evaluate(SCROLL_JS)                 # trigger lazy-loaded images (StoryMaps, Drupal, …)
     page.wait_for_timeout(SETTLE_MS)
-    shots = screenshot_iframes(page, "iframe")
+    shots = screenshot_iframes(page, "iframe, canvas")   # must match GENERIC_PREP_JS's replacement selector
     record["tabs"][0]["links"] = page.evaluate(LINKS_JS)
     record["tabs"][0]["text"] = page.evaluate(GENERIC_PREP_JS, shots)
+    if prev:                                     # re-diff against what will actually be stored
+        _, diff_text = diff_captures(prev, record)
+        if not diff_text:
+            print("Full capture matches the previous one after all — the quick "
+                  "check caught the page mid-load.")
+            if not force:
+                print("Nothing written (use --force to export anyway).")
+                browser.close()
+                return None
     page.wait_for_timeout(800)
     buf, height_px, n_pages = print_page(page, width)
     print(f"  rendered {safe_title}: {height_px}px" + (f" → {n_pages} pages" if n_pages > 1 else ""))
@@ -666,12 +757,21 @@ def write_pdf(pdfs, page_labels, bookmarks, record, prev_path, diff_text, title,
     return out
 
 
+def drive_download_url(url):
+    """Google Drive viewer/preview/embed links -> direct-download URL, else None."""
+    m = (re.search(r"drive\.google\.com/file/d/([\w-]+)", url)
+         or re.search(r"drive\.google\.com/(?:open|uc)\?[^\"']*?id=([\w-]+)", url))
+    return f"https://drive.google.com/uc?export=download&id={m.group(1)}" if m else None
+
+
 def fetch_files(folder, items):
     """Download linked documents into a capture folder. Items are URLs or
     (url, preferred_name) pairs. Keeps the server's filename (else the preferred
     name); an identical file already there is skipped, a different one with the
     same name gets a date stamp. Runs through Chromium's request stack so
-    redirects, cookies and content-disposition behave like a browser download."""
+    redirects, cookies and content-disposition behave like a browser download.
+    Google Drive links (file/d/…, /preview embeds, open?id=…) are converted to
+    direct downloads, including the are-you-sure page Drive serves for big files."""
     folder.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y-%m-%d %H%M")
     with sync_playwright() as p:
@@ -679,7 +779,15 @@ def fetch_files(folder, items):
         for item in items:
             url, preferred = item if isinstance(item, tuple) else (item, None)
             try:
-                r = req.get(url, timeout=60000)
+                drive = drive_download_url(url)
+                r = req.get(drive or url, timeout=60000)
+                if drive and r.ok and "text/html" in r.headers.get("content-type", ""):
+                    # big-file confirm page: replay its form (virus-scan bypass)
+                    body = r.text()
+                    action = re.search(r'action="([^"]+)"', body)
+                    fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', body))
+                    if action and fields:
+                        r = req.get(action.group(1).replace("&amp;", "&"), params=fields, timeout=120000)
                 if not r.ok:
                     print(f"  FAILED {url}: HTTP {r.status}")
                     continue
