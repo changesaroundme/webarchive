@@ -11,7 +11,7 @@ Two kinds of page are handled:
 
 Usage:
     python archive_page.py URL [output.pdf] [options]
-    python archive_page.py --all [options]      # re-check every archive page in sources.csv
+    python archive_page.py --all [options]      # re-check every archive page in sources.yaml
     python archive_page.py --due [options]      # only the pages whose check interval has elapsed
                                                 # (what the daily launchd job runs)
     python archive_page.py --fetch "<page title>" URL [URL ...]
@@ -31,14 +31,14 @@ Options:
     --verify            re-download every linked document and compare it byte-for-byte
                         (default: a HEAD request per file, skipped when ETag / size /
                         Last-Modified match what Attachments/.index.json recorded)
-    --all               batch mode: every row of calendars/sources.csv with archive=yes and
+    --all               batch mode: every page of calendars/sources.yaml with archive=yes and
                         status=active is re-checked in turn (the folder is still the page
                         title; the registry only supplies the list)
     --due               like --all, but a page is skipped until its `check` interval has
                         elapsed since the last check — inside a row's `expect` window the
                         interval tightens to daily. Both modes write calendars/docs/captures.json
                         (per slug: last checked, newest capture) for the public sources table.
-    --registry=FILE     sources.csv to read (default: ../calendars/sources.csv next to this repo)
+    --registry=FILE     sources.yaml to read (default: ../calendars/sources.yaml next to this repo)
     --sync              only mirror the archive to object storage (r2sync.py; needs the R2_*
                         settings) — with --dry-run to list what would upload, --verify to
                         compare sizes of what is already there
@@ -70,7 +70,6 @@ import re
 import sys
 import time
 import warnings
-import csv
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote
@@ -111,7 +110,7 @@ ARCHIVE_ROOT = Path(os.environ.get("CAM_ARCHIVE_ROOT") or ARCHIVE_TOOLING / "Web
 # --due read it, and the capture-times file goes back next to it so the build's
 # generated sources table can show an Archive column.
 CALENDARS_REPO = Path(os.environ.get("CAM_CALENDARS_REPO") or Path(__file__).resolve().parent.parent / "calendars")
-REGISTRY = CALENDARS_REPO / "sources.csv"
+REGISTRY = CALENDARS_REPO / "sources.yaml"
 CAPTURES = CALENDARS_REPO / "docs" / "captures.json"
 CHECK_INTERVALS = {"twice daily": 0.5, "daily": 1, "weekly": 7, "monthly": 30}
 CHECK_EVERY_RE = re.compile(r"every (\d+) (day|week|month)s?", re.IGNORECASE)
@@ -199,8 +198,15 @@ GENERIC_PREP_JS = """
   q('.ckeditor-accordion-container dt').forEach(d => d.classList.add('active'));   // Drupal accordions (austintexas.gov)
   q('.ckeditor-accordion-container dd').forEach(d => d.style.display = 'block');
   (""" + EXPAND_JS.strip() + """)(document.body);
-  // overlays (lightboxes, dialogs, cookie banners) must be hidden, not pinned into the flow
-  for (const e of q('[role="dialog"],[aria-modal="true"],.modal,.full-screen-modal,.ReactModalPortal,[class*="lightbox"],[class*="cookie"]')) e.style.display = 'none';
+  // overlays (lightboxes, dialogs, cookie banners) must be hidden, not pinned into the
+  // flow — but never the page itself: WordPress's Cookie Notice plugin puts a
+  // "cookies-not-accepted" class on <body> (lcra.org), and hiding that printed a
+  // blank page whose text was the raw source, scripts included (Sep 2026).
+  for (const e of q('[role="dialog"],[aria-modal="true"],.modal,.full-screen-modal,.ReactModalPortal,[class*="lightbox"],[class*="cookie"]')) {
+    if (e === document.body || e === document.documentElement) continue;
+    if (e.offsetHeight > window.innerHeight * 1.5 && !e.matches('[role="dialog"],[aria-modal="true"]')) continue;  // taller than the screen: page content, not an overlay
+    e.style.display = 'none';
+  }
   for (const e of q('*')) {
     const s = getComputedStyle(e);
     if (s.position !== 'fixed' && s.position !== 'sticky') continue;
@@ -223,26 +229,11 @@ GENERIC_PREP_JS = """
     e.style.setProperty('max-height', 'none', 'important');
   }
   for (const e of q('[class*="userway"],.grecaptcha-badge,[class*="VIpgJd"],.asw-menu-btn,.asw-container,[class*="print-wrapper"]')) e.style.display = 'none';
-  // ArcGIS Experience Builder "section" widgets show one "view" at a time behind
-  // Previous/Next arrows (the Airport Corridor page's 7-slide summary). Every view
-  // is in the DOM, just hidden — stack them so the print shows all of them, and
-  // let the ancestors grow (the height-freeze above pinned them).
-  for (const sec of q('.section-content')) {
-    const views = [...sec.children].filter(c => c.classList.contains('view-content'));
-    if (views.length < 2) continue;
-    const H = sec.getBoundingClientRect().height;
-    if (!H) continue;
-    sec.style.setProperty('height', (H * views.length) + 'px', 'important');
-    for (const v of views) {
-      for (const [k, val] of [['display', 'block'], ['position', 'relative'], ['height', H + 'px'], ['top', '0'], ['left', '0']])
-        v.style.setProperty(k, val, 'important');
-    }
-    for (let a = sec.parentElement; a && a !== document.body; a = a.parentElement) {
-      a.style.setProperty('height', 'auto', 'important');
-      a.style.setProperty('max-height', 'none', 'important');
-      a.style.setProperty('overflow', 'visible', 'important');
-    }
-  }
+  // ArcGIS Experience Builder "section" widgets (slide carousels behind
+  // Previous/Next arrows) print their current slide only. Stacking the hidden
+  // slides was tried (Sep 2026) and dropped: the section's absolute-positioned
+  // ancestors don't grow, so the stack overflows into the next block. The
+  // slides are JPEGs in the app's resource store — fetch those instead if wanted.
   if (iframeShots) q('iframe, canvas').forEach((f, i) => {   // canvases too: WebGL maps print blank
     if (!iframeShots[i]) return;
     const m = document.createElement('img');
@@ -392,19 +383,24 @@ def dedupe_images(pdf):
     """Chromium embeds a fresh copy of every image per page; point identical
     images (hero banner, logos) at one shared object instead."""
     seen = {}
-    for page in pdf.pages:
+    for n, page in enumerate(pdf.pages, 1):
         xobjects = page.Resources.get("/XObject")
         if xobjects is None:
             continue
-        for name in list(xobjects.keys()):
-            obj = xobjects[name]
-            if obj.get("/Subtype") != "/Image":
-                continue
-            key = hashlib.sha256(obj.read_raw_bytes()).hexdigest()
-            if key in seen and seen[key].objgen != obj.objgen:
-                xobjects[name] = seen[key]
-            else:
-                seen.setdefault(key, obj)
+        try:
+            for name, obj in list(xobjects.items()):
+                if obj.get("/Subtype") != "/Image":
+                    continue
+                key = hashlib.sha256(obj.read_raw_bytes()).hexdigest()
+                if key in seen and seen[key].objgen != obj.objgen:
+                    xobjects[name] = seen[key]
+                else:
+                    seen.setdefault(key, obj)
+        except (ValueError, KeyError) as e:
+            # Chromium occasionally writes a resource under an empty name ("/"),
+            # which pikepdf refuses to address (capmetro.org, Sep 2026). The
+            # page prints fine; it just keeps its own image copies.
+            print(f"  (image de-duplication skipped on page {n}: {e})")
 
 
 def clean_lines(text):
@@ -513,13 +509,21 @@ def navigate(page, url=None, attempts=3):
     """page.goto(url) — or page.reload() when url is None — retried on the
     transient network errors Chromium raises when the link blips (the container's
     network coming up just after the service starts, Wi-Fi roaming, a VPN
-    reconnecting): ERR_NETWORK_CHANGED and friends. Anything else raises at once."""
+    reconnecting): ERR_NETWORK_CHANGED and friends. A page whose `load` event
+    never fires (capmetro.org, Sep 2026: some request on the page never
+    completes) is taken once its DOM is ready instead — the settle steps that
+    follow wait for the content anyway. Anything else raises at once."""
+    wait = "load"
     for attempt in range(1, attempts + 1):
         try:
             if url is None:
-                return page.reload(wait_until="load", timeout=60000)
-            return page.goto(url, wait_until="load", timeout=60000)
+                return page.reload(wait_until=wait, timeout=60000)
+            return page.goto(url, wait_until=wait, timeout=60000)
         except Exception as e:
+            if "Timeout" in type(e).__name__ and wait == "load":
+                print("  load event never fired within 60 s; continuing once the DOM is ready")
+                wait = "domcontentloaded"
+                continue
             if attempt == attempts or not any(code in str(e) for code in TRANSIENT_NET):
                 raise
             print(f"  network blip ({str(e).split(chr(10))[0][:80]}); retrying in 5 s")
@@ -596,6 +600,7 @@ def detect_org(page, url, is_publicinput):
 OVER_CAP = []                 # (url, MB) of pages whose new documents exceeded DOC_CAP_MB this run
 DOC_FAILURES = []             # (page folder, url, reason) for every document that could not be fetched this run
 LAST = {}                     # out_dir / safe_title of the page archive() handled last (batch bookkeeping)
+MISREADS = []                 # titles whose quick read differed from the previous capture but the full capture did not
 VERBOSE = True                # single-page runs show diffs and every document; batch runs summarise (--verbose to restore)
 
 
@@ -756,10 +761,10 @@ def _capture(url, explicit_out, out_dir, width, original_hero, force, root):
         if prev:
             _, diff_text = diff_captures(prev, record)
             if not diff_text:
-                print("Full capture matches the previous one after all — the quick "
-                      "check misread a still-loading tab.")
+                MISREADS.append(title)
+                print("Unchanged after all (the quick read caught a tab still loading)"
+                      + ("" if force else " — nothing written."))
                 if not force:
-                    print("Nothing written (use --force to export anyway).")
                     browser.close()
                     return None, prev, out_dir
 
@@ -906,16 +911,92 @@ def sync_docs(out_dir, record, all_docs=False, verify=False):
     unless --all-docs. Returns the over-cap MB, or 0."""
     docs = documents_from(record)
     pages = linked_pages_from(record)
-    if not docs and not pages:
+    slides = exb_slides(record.get("url", ""))
+    if not docs and not pages and not slides:
         return 0
     over = 0
     if docs:
         print(f"Documents: {len(docs)} linked")
         over = fetch_files(out_dir / "Attachments", [(u, n) for u, n in docs.items()],
                            cap_mb=None if all_docs else DOC_CAP_MB, verify=verify)
+    if slides:
+        print(f"Slides: {len(slides)} in the app's carousels")
+        over += fetch_files(out_dir / "Attachments", slides, cap_mb=None if all_docs else DOC_CAP_MB,
+                            verify=verify, types=DOC_TYPES + ("image/",))
     if pages:
         capture_linked_pages(out_dir / "Attachments", pages)
     return over
+
+
+# The slides of an Experience Builder carousel (a "section" widget with several
+# "views" behind Previous/Next arrows) are images uploaded into the app — the
+# Airport Corridor page's segment summary, its plan sheets. The print shows only
+# the current slide, and stacking the hidden ones breaks the layout, so the
+# originals are fetched from the app's resource store instead and kept as
+# documents: the app's public config (the item's /data) lists every view's
+# background image with the name it was uploaded under.
+EXB_ITEM_URL = "https://www.arcgis.com/sharing/rest/content/items/{id}/data?f=json"
+EXB_RESOURCE_URL = "https://www.arcgis.com/sharing/rest/content/items/{id}/resources"
+
+
+def exb_slides(url):
+    """[(image url, file name)] for every carousel slide in the app at `url`,
+    named `<page> slides [<n>] <NN> - <uploaded name>`; [] for any other site or
+    when the config cannot be read (the capture proceeds without)."""
+    m = EXB_RE.match(url)
+    if not m:
+        return []
+    item = m.group(1).rsplit("/", 1)[1]
+    try:
+        from urllib.request import Request, urlopen
+        with urlopen(Request(EXB_ITEM_URL.format(id=item), headers={"User-Agent": "Mozilla/5.0 archive_page.py"}),
+                     timeout=30) as r:
+            cfg = json.load(r)
+    except Exception as e:
+        print(f"  (could not read the app's config for its slides: {e})")
+        return []
+    layouts, widgets, sections, views = (cfg.get(k, {}) for k in ("layouts", "widgets", "sections", "views"))
+    resources = EXB_RESOURCE_URL.format(id=item)
+
+    def sections_in(layout_ids, seen, acc):
+        """Section ids reachable from these layouts, in document order."""
+        for lid in layout_ids:
+            if not lid or lid in seen:
+                continue
+            seen.add(lid)
+            for c in layouts.get(lid, {}).get("content", {}).values():
+                if c.get("type") == "SECTION" or c.get("sectionId"):
+                    sid = c.get("sectionId") or c.get("widgetId")
+                    acc.append(sid)
+                    for vid in sections.get(sid, {}).get("views", []):
+                        sections_in(views.get(vid, {}).get("layout", {}).values(), seen, acc)
+                w = widgets.get(c.get("widgetId"), {})
+                nested = [v for group in w.get("layouts", {}).values()
+                          for v in (group.values() if isinstance(group, dict) else [group])]
+                sections_in(nested, seen, acc)
+
+    order = [next(iter(p)) for p in cfg.get("pageStructure", []) if p] or list(cfg.get("pages", {}))
+    out, seen_urls = [], set()
+    for pid in order:
+        page = cfg.get("pages", {}).get(pid, {})
+        found: list = []
+        sections_in(page.get("layout", {}).values(), set(), found)
+        carousels = [s for s in dict.fromkeys(found) if len(sections.get(s, {}).get("views", [])) > 1
+                     and any((views.get(v, {}).get("backgroundIMage") or {}).get("url") for v in sections[s]["views"])]
+        for k, sid in enumerate(carousels, 1):
+            label = page.get("label", pid).strip() + " slides" + (f" {k}" if len(carousels) > 1 else "")
+            for i, vid in enumerate(sections[sid]["views"], 1):
+                img = views.get(vid, {}).get("backgroundIMage") or {}
+                src = img.get("url") or ""
+                if not src:
+                    continue
+                src = src.replace("${appResourceUrl}", resources)
+                if src in seen_urls:
+                    continue
+                seen_urls.add(src)
+                name = img.get("originalName") or img.get("fileName") or src.rsplit("/", 1)[1]
+                out.append((src, f"{label} {i:02d} - {name}"))
+    return out
 
 
 # ArcGIS Experience Builder apps (experience.arcgis.com/experience/<id>/page/<name>)
@@ -953,11 +1034,18 @@ def archive_generic(page, browser, url, title, safe_title, stamp, out, out_dir, 
     — or one page per sub-page for an Experience Builder app."""
     pages = subpages(page, url) or [(safe_title, None)]      # url None: already loaded, reload in place
     print(f"{title}: " + (f"{len(pages)} pages: " + ", ".join(n for n, _ in pages) if len(pages) > 1 else "single page"))
+    # Quick pass: the text of every page, read the same way the full pass reads
+    # it (scrolled, so lazy-loaded sections exist; DOM settled, so staged widgets
+    # have arrived). Reading it any more cheaply made the text differ from the
+    # last capture's on every visit, and each such "change" cost a full capture
+    # that was then discarded as unchanged (the mid-load note, Sep 2026).
     tabs = []
     for i, (name, u) in enumerate(pages):
         if i:                                         # the first is already loaded
             navigate(page, u)
             page.wait_for_timeout(SETTLE_MS * 2)
+        page.evaluate(SCROLL_JS)
+        settled_dom(page)
         tabs.append({"name": name, "text": page.evaluate(GENERIC_PREP_JS, None)})
     record = {"title": title, "url": url, "org": org, "exported": stamp, "width": width, "tabs": tabs}
     prev_path, prev, diff_text, proceed = check_changes(record, out_dir, safe_title, out, force)
@@ -986,10 +1074,10 @@ def archive_generic(page, browser, url, title, safe_title, stamp, out, out_dir, 
     if prev:                                     # re-diff against what will actually be stored
         _, diff_text = diff_captures(prev, record)
         if not diff_text:
-            print("Full capture matches the previous one after all — the quick "
-                  "check caught the page mid-load.")
+            MISREADS.append(title)
+            print("Unchanged after all (the quick read caught the page mid-load)"
+                  + ("" if force else " — nothing written."))
             if not force:
-                print("Nothing written (use --force to export anyway).")
                 browser.close()
                 return (None, record)
     browser.close()
@@ -1000,9 +1088,16 @@ def write_pdf(pdfs, page_labels, bookmarks, record, prev_path, diff_text, title,
     merged = pikepdf.Pdf.new()
     for buf in pdfs:
         with pikepdf.open(io.BytesIO(buf)) as src:
-            if hasattr(merged, "add_pages_from"):        # pikepdf >= 10.11: preserves link targets
+            before = len(merged.pages)
+            try:
+                # pikepdf >= 10.11: carries link targets across. It chokes on a
+                # link to an EMPTY named destination — Chromium writes one for an
+                # `href="#"` anchor (capmetro.org, Sep 2026) — after it has already
+                # appended the pages, so undo that and fall back to the plain copy,
+                # which keeps the page and drops that useless link.
                 merged.add_pages_from(src)
-            else:                                        # older pikepdf: same result for our link-free pages
+            except (AttributeError, ValueError):
+                del merged.pages[before:]
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     merged.pages.extend(src.pages)
@@ -1087,11 +1182,12 @@ def _unchanged(entry, probe):
     return entry["size"] == probe["size"]
 
 
-def fetch_files(folder, items, cap_mb=None, verify=False):
+def fetch_files(folder, items, cap_mb=None, verify=False, types=DOC_TYPES):
     """Download linked documents into a capture folder. Items are URLs or
     (url, preferred_name) pairs. Keeps the server's filename (else the preferred
     name); an identical file already there is skipped, a different one with the
-    same name gets a date stamp. Runs through Chromium's request stack so
+    same name gets a date stamp. `types` are the content types accepted for a
+    URL without a document extension. Runs through Chromium's request stack so
     redirects, cookies and content-disposition behave like a browser download.
     Google Drive links (file/d/…, /preview embeds, open?id=…) are converted to
     direct downloads, including the are-you-sure page Drive serves for big files.
@@ -1121,7 +1217,7 @@ def fetch_files(folder, items, cap_mb=None, verify=False):
             if not probe["ok"]:
                 _doc_failed(folder, url, f"HTTP {probe['status']}")
                 continue
-            if not DOC_EXT_RE.search(url) and not probe["type"].startswith(DOC_TYPES):
+            if not DOC_EXT_RE.search(url) and not probe["type"].startswith(types):
                 continue                                   # a download-looking link that serves HTML
             entry = index.get(url)
             if entry and (folder / entry["name"]).exists():
@@ -1193,11 +1289,20 @@ def fetch_files(folder, items, cap_mb=None, verify=False):
     return over_cap
 
 
+def _caltools_registry():
+    """The calendars repo's registry module (sources.yaml's loader and the
+    `expect` grammar), from the checkout next to this one — one implementation
+    of the file format, used by both jobs."""
+    if str(CALENDARS_REPO) not in sys.path:
+        sys.path.insert(0, str(CALENDARS_REPO))
+    from caltools import registry
+    return registry
+
+
 def registry_pages(path=REGISTRY):
-    """The rows of sources.csv this script owns: archive=yes and status=active
-    (paused and retired rows are left alone; git remembers them)."""
-    with open(path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+    """The pages of sources.yaml this script owns: archive=yes and status=active
+    (paused and retired pages are left alone; git remembers them)."""
+    rows = _caltools_registry().load(Path(path))
     return [r for r in rows if r.get("archive") == "yes" and r.get("status") == "active"]
 
 
@@ -1213,17 +1318,8 @@ def check_interval(check):
 
 
 def in_expect_window(expect, today):
-    """Is the page in its `expect` season? Uses the calendars repo's grammar
-    (caltools/registry.py) when that repo is checked out next to this one, so
-    there is one implementation; without it every page is treated as in
-    season, which only means daily checks."""
-    try:
-        if str(CALENDARS_REPO) not in sys.path:
-            sys.path.insert(0, str(CALENDARS_REPO))
-        from caltools.registry import expected_now
-    except ImportError:
-        return True
-    return expected_now(expect, today)
+    """Is the page in its `expect` season? (The calendars repo's grammar.)"""
+    return _caltools_registry().expected_now(expect, today)
 
 
 STAMP_RE = re.compile(r" - (\d{4}-\d{2}-\d{2} \d{4})\.pdf$")
@@ -1277,8 +1373,12 @@ def run_batch(due_only, opts, registry_path=REGISTRY, captures_path=CAPTURES):
         try:
             result = archive(r["url"], **opts)
         except Exception as e:
-            failed.append((slug, e))
-            print(f"FAILED {slug}: {e}\n")
+            # Where it broke, in one line: the summary is all a scheduled run leaves behind.
+            import traceback
+            frames = [f for f in traceback.extract_tb(e.__traceback__) if f.filename.endswith("archive_page.py")]
+            where = f" (archive_page.py:{frames[-1].lineno} in {frames[-1].name})" if frames else ""
+            failed.append((slug, f"{e}{where}"))
+            print(f"FAILED {slug}: {e}{where}\n")
             continue
         if result:
             written.append(result.name)
@@ -1313,6 +1413,10 @@ def run_batch(due_only, opts, registry_path=REGISTRY, captures_path=CAPTURES):
         print("  failed: ", slug, "—", e)
     for url, mb in OVER_CAP:
         print(f"  documents skipped ({mb:,} MB over cap; use --all-docs):", url)
+    if MISREADS:
+        # Each of these cost a full capture that was then discarded. A page that
+        # shows up here run after run loads in a way the quick read mishandles.
+        print(f"  quick read differed, full capture did not ({len(MISREADS)}): " + ", ".join(MISREADS))
     if DOC_FAILURES:
         print(f"Documents not fetched: {len(DOC_FAILURES)}")
         for page, url, reason in DOC_FAILURES:

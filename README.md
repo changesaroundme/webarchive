@@ -31,7 +31,7 @@ script directly on the Mac is still possible, for one-off captures or debugging:
 
     cd webarchive
     python3 -m venv .venv
-    .venv/bin/pip install playwright pikepdf boto3
+    .venv/bin/pip install playwright pikepdf boto3 pyyaml
     .venv/bin/playwright install chromium
 
 The venv lives inside the checkout and is gitignored; delete the folder to remove it.
@@ -47,7 +47,7 @@ The venv lives inside the checkout and is gitignored; delete the folder to remov
     .venv/bin/python archive_page.py <url> --no-docs           # skip auto-download of linked documents
     .venv/bin/python archive_page.py <url> --all-docs          # lift the 500 MB per-page document cap
     .venv/bin/python archive_page.py --all --verify            # re-download and hash every linked document
-    .venv/bin/python archive_page.py --all                    # re-check every archive page in sources.csv; writes only what changed
+    .venv/bin/python archive_page.py --all                    # re-check every archive page in sources.yaml; writes only what changed
     .venv/bin/python archive_page.py --due                    # only the pages whose check interval has elapsed (the daily job)
     .venv/bin/python archive_page.py --all --verbose          # batch with full diffs and every unchanged file listed
     .venv/bin/python archive_page.py --fetch "Central City District Plan" 'https://…/report.pdf' 'https://…/boards.pdf'
@@ -63,13 +63,15 @@ page's capture as a baseline and says so.
 
 ## The page list and the daily job
 
-`--all` and `--due` read `../calendars/sources.csv` (the calendars repo checked out next to
-this one; `--registry=FILE` to point elsewhere): every row with `archive: yes` and
+`--all` and `--due` read `../calendars/sources.yaml` (the calendars repo checked out next to
+this one; `--registry=FILE` to point elsewhere): every page with `archive: yes` and
 `status: active`. The registry only supplies the list — captures still land in the page-title
 folder. `--due` skips a page until its `check` interval has elapsed (`daily`, `weekly`,
-`every 3 days`, …) since the last check; while a row is inside its `expect` window
+`every 3 days`, …) since the last check; while a page is inside its `expect` window
 (`every 1 year Jun-Aug` for the UTP page) the interval tightens to daily. A page not in
-the registry is no longer visited: add a row, or leave its folder as history.
+the registry is no longer visited: add a page, or leave its folder as history. The file format
+is documented at the top of `sources.yaml` and in `caltools/registry.py`; the archive job
+imports that module from the calendars checkout, so there is one loader.
 
 Both modes write `../calendars/docs/captures.json` — per slug, when the page was last
 checked and the file name and time of its newest capture. Nothing else goes in it (no
@@ -241,17 +243,31 @@ that error; the file is committed so the container and any other runner get it t
 `r2sync.py` mirrors the archive into an S3-compatible bucket after every batch run, and
 on its own with `./run.sh --sync` (`--dry-run` lists what would upload without uploading;
 `--verify` also compares the sizes of what is already there). The bucket is append-only
-history: each capture and each document
-version is uploaded once under a key that never changes, and nothing is ever deleted
-or overwritten. Keys:
+history: each capture and each document version is uploaded once under a key that never
+changes, and nothing is deleted. The one key that is overwritten is each page's
+`latest.pdf` — a copy of its newest capture under a stable address, so a link to it keeps
+working as captures accumulate and after the page itself is gone. Keys:
 
-    <slug>/<YYYY-MM-DD HHMM> - <page title>.pdf              a page capture
-    <slug>/attachments/<YYYY-MM-DD HHMM> - <file name>       a document, stamped with when it was fetched
-    _unlisted/<folder name>/...                              a folder with no registry row
+    <slug>/latest.pdf                          the newest capture of the page (refreshed as captures arrive)
+    <slug>/2026-09-01-1652.pdf                 every capture, by its local capture time
+    <slug>/files/2026-09-10-0900/<file name>   a document, by the time it was fetched, named as the site served it
+    _unlisted/<folder name>/...                a folder with no registry row
 
-Stamp first so a listing sorts by time; the local files keep their own names. The
-document stamp comes from `Attachments/.index.json` (`fetched`); a file the index does
-not know gets its modification time.
+The slug is the page's `sources.yaml` slug; the local folders and files keep their own
+names, this mapping lives only in `r2sync.py`. The document stamp comes from
+`Attachments/.index.json` (`fetched`); a file the index does not know gets its
+modification time.
+
+After each sync two files in the calendars checkout describe the bucket for the build:
+`docs/captures.json` gains each page's `url` (its `latest.pdf`), which the generated
+sources table links from the *Archive* column, and `docs/archive.json` lists every
+capture and document with its public URL, from which the build renders `docs/archive.md`
+— the vault's *Archive* page, one section per page with the latest link, the dated
+captures and the files. Commit both after a run.
+
+`--purge-old-keys` deletes objects under the first key scheme (September 2026:
+`<stamp> - <title>.pdf` and `attachments/`); it was a one-off after the re-key and needs
+a token with delete permission. Nothing else in the sync deletes.
 
 Settings live in `~/.config/cam-webarchive/r2.env` (`KEY=value` lines, `chmod 600`;
 `run.sh` passes them into the container, and the file is outside the repo):
@@ -262,9 +278,9 @@ Settings live in `~/.config/cam-webarchive/r2.env` (`KEY=value` lines, `chmod 60
     R2_SECRET_ACCESS_KEY=<token secret>
     R2_PUBLIC_URL=https://<custom domain or r2.dev host>
 
-The API token should be scoped to that one bucket with object read + write (no delete
-needed — the sync never deletes). With `R2_PUBLIC_URL` set, `captures.json` gains each
-page's newest-capture URL and the generated sources table links the *Archive* column.
+The API token should be scoped to that one bucket with object read + write (Cloudflare's
+"Object Read & Write" includes delete, which only `--purge-old-keys` uses). Without
+`R2_PUBLIC_URL` the sync still uploads but writes no URLs.
 
 The same image is what a cloud runner (GitHub Actions) or a home server would use;
 only `run.sh`'s mounts would change.
@@ -321,6 +337,13 @@ a file already there and identical is skipped, a changed one gets a date stamp. 
 `cam-archive-review` skill, which reads each capture's links and `changes.diff` and
 proposes a shortlist — nothing is downloaded until you run the command it gives you.
 
+An ArcGIS Experience Builder app's carousels (a slide show behind Previous/Next
+arrows — the Airport Corridor page's segment summary and plan sheets) print as
+their current slide only. The slides are images uploaded into the app, so every
+run also fetches them from the app's public resource store into `Attachments/`,
+under the usual index rules, named `<page> slides NN - <name as uploaded>.jpg`;
+the same image used on two pages is fetched once.
+
 ## Change tracking
 
 Each run first does a quick text-only walk of the tabs (no image settling or
@@ -332,9 +355,14 @@ and prints a per-tab summary plus the diff (a diff longer than
 `MAX_DIFF_PRINT_LINES` is truncated in the log — the full diff is always embedded
 in the new PDF as `changes.diff`). After the full capture, the diff is recomputed
 from what will actually be stored: if the full capture turns out identical to the
-previous one (the quick check misread a still-loading tab), nothing is written. **If nothing changed, no new PDF is
+previous one (the quick check misread a still-loading tab), nothing is written and
+the log says "Unchanged after all"; a batch run's summary counts these, since each
+one cost a full capture for nothing — a page that appears there every run loads in
+a way the quick read mishandles. **If nothing changed, no new PDF is
 written** (pass `--force` to export anyway); only a changed page pays for the
-full capture. Renamed tabs are paired by position and reported as
+full capture. On non-PublicInput pages the quick read scrolls the page and waits
+for the DOM to settle exactly as the full capture does, so lazy-loaded sections
+do not register as a change on every visit. Renamed tabs are paired by position and reported as
 `Old → New (renamed)`; a genuinely new or removed tab counts as a change.
 Dynamic UI noise (comment counters, "N characters remaining", relative
 timestamps) is filtered via `NOISE_PATTERNS` at the top of the script — add a

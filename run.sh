@@ -16,7 +16,7 @@ export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
 
 command -v container >/dev/null || { echo "Apple's container tool is not installed (https://github.com/apple/container/releases)"; exit 1; }
 [ -d "$ARCHIVE" ] || { echo "archive folder not found: $ARCHIVE"; exit 1; }
-[ -f "$CALENDARS/sources.csv" ] || { echo "calendars checkout not found: $CALENDARS"; exit 1; }
+[ -f "$CALENDARS/sources.yaml" ] || { echo "calendars checkout not found: $CALENDARS"; exit 1; }
 
 # The container service runs only for the duration of the job: started here
 # (idempotent), stopped at the end, so nothing lingers between runs. The Linux

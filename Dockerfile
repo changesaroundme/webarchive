@@ -11,14 +11,14 @@ FROM python:3.12-slim-bookworm
 # extra lines and overlap fixed-height blocks. Lato and Liberation Sans are
 # close in width; container/fonts.conf maps the names to them.
 RUN apt-get update && apt-get install -y --no-install-recommends tzdata fonts-lato fonts-liberation fonts-noto-core \
- && pip install --no-cache-dir playwright pikepdf boto3 \
+ && pip install --no-cache-dir playwright pikepdf boto3 pyyaml \
  && playwright install --with-deps chromium \
  && rm -rf /var/lib/apt/lists/*
 COPY container/fonts.conf /etc/fonts/local.conf
 RUN fc-cache -f
 
 # Mount points run.sh fills: the vault's Web Archive folder and the calendars
-# checkout (sources.csv in, docs/captures.json out). Capture stamps are local
+# checkout (sources.yaml in, docs/captures.json out). Capture stamps are local
 # time, so the container keeps Austin's clock.
 ENV CAM_ARCHIVE_ROOT=/archive \
     CAM_CALENDARS_REPO=/calendars \
