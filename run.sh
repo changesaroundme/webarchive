@@ -47,7 +47,9 @@ fi
 # The vault's Organizations folder is optional: when it is here, batch runs
 # end by filling the Checked / Last changed / capture cells of its link tables.
 vol_args=()
-[ -d "$VAULT/Organizations" ] && vol_args+=(--volume "$VAULT/Organizations:/vault/Organizations")
+# CAM_VAULT_ROOT is passed as well as baked into the image, so an image built
+# before the vault mount existed still finds it.
+[ -d "$VAULT/Organizations" ] && vol_args+=(--volume "$VAULT/Organizations:/vault/Organizations" --env CAM_VAULT_ROOT=/vault)
 set +e
 # (bash 3.2 on macOS: an empty array is "unbound" under set -u, hence the idiom)
 container run --rm --cpus 2 --memory 4g ${env_args[@]+"${env_args[@]}"} ${vol_args[@]+"${vol_args[@]}"} \
