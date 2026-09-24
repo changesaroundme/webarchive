@@ -406,7 +406,15 @@ a way the quick read mishandles. **If nothing changed, no new PDF is
 written** (pass `--force` to export anyway); only a changed page pays for the
 full capture. On non-PublicInput pages the quick read scrolls the page and waits
 for the DOM to settle exactly as the full capture does, so lazy-loaded sections
-do not register as a change on every visit. Renamed tabs are paired by position and reported as
+do not register as a change on every visit.
+
+A full capture that lacks lines the previous capture had gets a **second look**:
+content that fails to load (an ArcGIS map legend, a survey's ranking results —
+both Sep 2026) can only ever show up as a removal, so the whole capture is taken
+again, each affected tab scrolling and waiting up to `RECHECK_MS` for the missing
+lines to appear. The log says how many came back ("second look [tab]: 4 of 4
+missing line(s) appeared"); whatever is still missing is treated as removed from
+the site. A real removal costs that wait once, on the run that records it. Renamed tabs are paired by position and reported as
 `Old → New (renamed)`; a genuinely new or removed tab counts as a change.
 Dynamic UI noise (comment counters, "N characters remaining", relative
 timestamps) is filtered via `NOISE_PATTERNS` at the top of the script — add a

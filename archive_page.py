@@ -93,6 +93,7 @@ PX_PER_IN = 96
 SETTLE_MS = 1800              # wait after tab content arrives (images, charts, embeds) — full capture
 QUICK_SETTLE_MS = 300         # polling interval while waiting for a tab's text to stop changing (change-check pass)
 TAB_TIMEOUT_MS = 12000
+RECHECK_MS = 20000            # second look: how long a tab may take to show text the last capture had
 HERO_JPEG_QUALITY = 90        # hero banner is captured once at 2x (Retina) and shared by all pages
 MAX_PAGE_PX = 0               # 0 = one page per tab regardless of height (Preview is fine with very tall pages).
                               # Set to e.g. 18000 to split taller tabs onto continuation pages (Acrobat caps pages at 200in = 19200px).
@@ -555,6 +556,44 @@ def settled_dom(page):
         last = size
 
 
+def lost_lines(prev, record):
+    """Lines of the previous capture that this one lacks, per tab of this one:
+    {tab index: [lines]}. Content that failed to load (a map legend, survey
+    results, a widget) shows up here as a removal — the only kind of change a
+    slow page can fake — so a capture with any is given a second look."""
+    out = {}
+    prev_tabs = {t["name"]: t for t in prev.get("tabs", [])}
+    for i, tab in enumerate(record["tabs"]):
+        old = prev_tabs.get(tab["name"])
+        if old is None and len(prev.get("tabs", [])) == len(record["tabs"]):
+            old = prev["tabs"][i]                  # renamed tab: pair by position
+        if old is None:
+            continue
+        have = set(clean_lines(tab["text"] or ""))
+        gone = [l for l in clean_lines(old["text"] or "") if l not in have]
+        if gone:
+            out[i] = gone
+    return out
+
+
+def wait_for_lines(page, lines, root_js="document.body"):
+    """Second look at one tab or page: keep scrolling (lazy sections, charts
+    drawn on view) and re-reading until every line appears in the DOM text —
+    hidden text counts, whitespace ignored — or RECHECK_MS passes. Returns how
+    many appeared."""
+    want = [" ".join(l.split()) for l in lines][:200]
+    deadline = time.time() + RECHECK_MS / 1000
+    found = 0
+    while True:
+        text = page.evaluate(f"() => {{ const r = {root_js}; return r ? r.textContent : ''; }}") or ""
+        text = " ".join(text.split())
+        found = sum(1 for l in want if l in text)
+        if found == len(want) or time.time() > deadline:
+            return found
+        page.evaluate(SCROLL_JS)
+        page.wait_for_timeout(1000)
+
+
 def clean_title(title):
     """'Sir Swante Palm ... | Austin Parks | AustinTexas.gov' -> 'Sir Swante Palm ...';
     'Central City District Plan - PublicInput' -> 'Central City District Plan'."""
@@ -731,33 +770,49 @@ def _capture(url, explicit_out, out_dir, width, original_hero, force, root):
             return None, prev, out_dir
 
         # Full pass: reload for a clean DOM, then visit every tab and snapshot it
-        # with images settled and embeds/hero screenshotted.
-        navigate(page)
-        page.wait_for_timeout(SETTLE_MS * 2)
-        for idx, (tid, name) in enumerate(zip(tab_ids, tab_names)):
-            if is_survey:
-                goto_step(idx)
-            elif tid is not None:
-                goto_tab(tid)
-            settled_dom(page)                      # questions / comment widgets load after the tab swap
-            page.wait_for_timeout(SETTLE_MS)       # then images, charts, embeds
-            shots = screenshot_iframes(page, "section.project-content iframe")   # map/video embeds as seen on screen
-            hero_shot = None
-            if idx == 0 and not original_hero:
-                hero = page.locator(".header-div")
-                if hero.count() and hero.first.is_visible():
-                    hero_shot = base64.b64encode(hero.first.screenshot(
-                        type="jpeg", quality=HERO_JPEG_QUALITY, timeout=5000)).decode()
-            got = page.evaluate(SNAP_JS, [shots, hero_shot])
-            if got == -1:
-                sys.exit("No section.project-content found — is this a PublicInput page?")
-            if VERBOSE:
-                print(f"  snapped [{idx+1}/{len(tab_ids)}] {name}" +
-                      (f" ({len([s for s in shots if s])} embed(s) captured)" if shots else ""))
-        # the record's text comes from the full pass too, so it matches the rendered pages
-        record["tabs"] = [{"name": nm, "text": tx, "links": lk}
-                          for nm, tx, lk in zip(tab_names, page.evaluate("() => window.__piTexts"),
-                                                page.evaluate("() => window.__piLinks"))]
+        # with images settled and embeds/hero screenshotted. On a second look
+        # (wait_for: tab index -> lines the last capture had), a tab first waits
+        # for those lines to appear.
+        def full_pass(wait_for=None):
+            navigate(page)
+            page.wait_for_timeout(SETTLE_MS * 2)
+            for idx, (tid, name) in enumerate(zip(tab_ids, tab_names)):
+                if is_survey:
+                    goto_step(idx)
+                elif tid is not None:
+                    goto_tab(tid)
+                settled_dom(page)                      # questions / comment widgets load after the tab swap
+                if wait_for and idx in wait_for:
+                    n = wait_for_lines(page, wait_for[idx], "document.querySelector('section.project-content')")
+                    print(f"  second look [{name}]: {n} of {len(wait_for[idx])} missing line(s) appeared")
+                    settled_dom(page)
+                page.wait_for_timeout(SETTLE_MS)       # then images, charts, embeds
+                shots = screenshot_iframes(page, "section.project-content iframe")   # map/video embeds as seen on screen
+                hero_shot = None
+                if idx == 0 and not original_hero:
+                    hero = page.locator(".header-div")
+                    if hero.count() and hero.first.is_visible():
+                        hero_shot = base64.b64encode(hero.first.screenshot(
+                            type="jpeg", quality=HERO_JPEG_QUALITY, timeout=5000)).decode()
+                got = page.evaluate(SNAP_JS, [shots, hero_shot])
+                if got == -1:
+                    sys.exit("No section.project-content found — is this a PublicInput page?")
+                if VERBOSE:
+                    print(f"  snapped [{idx+1}/{len(tab_ids)}] {name}" +
+                          (f" ({len([s for s in shots if s])} embed(s) captured)" if shots else ""))
+            # the record's text comes from the full pass too, so it matches the rendered pages
+            return [{"name": nm, "text": tx, "links": lk}
+                    for nm, tx, lk in zip(tab_names, page.evaluate("() => window.__piTexts"),
+                                          page.evaluate("() => window.__piLinks"))]
+
+        record["tabs"] = full_pass()
+        # Anything the last capture had that this one lacks may simply not have
+        # loaded (a survey's ranking results, Sep 2026): take the whole pass
+        # again, waiting on those lines. What is still missing was removed.
+        lost = lost_lines(prev, record) if prev else {}
+        if lost:
+            print(f"  {sum(map(len, lost.values()))} line(s) of the last capture missing — taking a second look")
+            record["tabs"] = full_pass(lost)
 
         # Re-diff against the FULL capture: the embedded changes.diff must describe
         # what capture.json actually stores. If the quick pass misread a tab (e.g. a
@@ -1057,25 +1112,42 @@ def archive_generic(page, browser, url, title, safe_title, stamp, out, out_dir, 
     if not proceed:
         browser.close()
         return (None, prev)          # unchanged: caller still syncs documents against the last record
-    pdfs, labels, bookmarks = [], [], []
-    for (name, u), tab in zip(pages, tabs):
-        if u is None:
-            navigate(page)                            # a clean DOM: the quick pass expanded things in place
-        else:
-            navigate(page, u)
-        page.wait_for_timeout(SETTLE_MS * 2)
-        page.evaluate(SCROLL_JS)                 # trigger lazy-loaded images (StoryMaps, Drupal, …)
-        page.wait_for_timeout(SETTLE_MS)
-        shots = screenshot_iframes(page, "iframe, canvas")   # must match GENERIC_PREP_JS's replacement selector
-        tab["links"] = page.evaluate(LINKS_JS)
-        tab["text"] = page.evaluate(GENERIC_PREP_JS, shots)
-        page.wait_for_timeout(800)
-        buf, height_px, n_pages = print_page(page, width)
-        if VERBOSE:
-            print(f"  rendered {name}: {height_px}px" + (f" → {n_pages} pages" if n_pages > 1 else ""))
-        bookmarks.append((name, len(labels)))
-        labels += [name] if n_pages == 1 else [f"{name} ({k}/{n_pages})" for k in range(1, n_pages + 1)]
-        pdfs.append(buf)
+    def full_pass(wait_for=None):
+        """Print every page; on a second look (wait_for: page index -> lines the
+        last capture had) each such page first waits for those lines."""
+        pdfs, labels, bookmarks = [], [], []
+        for i, ((name, u), tab) in enumerate(zip(pages, tabs)):
+            if u is None:
+                navigate(page)                        # a clean DOM: the quick pass expanded things in place
+            else:
+                navigate(page, u)
+            page.wait_for_timeout(SETTLE_MS * 2)
+            page.evaluate(SCROLL_JS)                  # trigger lazy-loaded images (StoryMaps, Drupal, …)
+            page.wait_for_timeout(SETTLE_MS)
+            if wait_for and i in wait_for:
+                n = wait_for_lines(page, wait_for[i])
+                print(f"  second look [{name}]: {n} of {len(wait_for[i])} missing line(s) appeared")
+                settled_dom(page)
+            shots = screenshot_iframes(page, "iframe, canvas")   # must match GENERIC_PREP_JS's replacement selector
+            tab["links"] = page.evaluate(LINKS_JS)
+            tab["text"] = page.evaluate(GENERIC_PREP_JS, shots)
+            page.wait_for_timeout(800)
+            buf, height_px, n_pages = print_page(page, width)
+            if VERBOSE:
+                print(f"  rendered {name}: {height_px}px" + (f" → {n_pages} pages" if n_pages > 1 else ""))
+            bookmarks.append((name, len(labels)))
+            labels += [name] if n_pages == 1 else [f"{name} ({k}/{n_pages})" for k in range(1, n_pages + 1)]
+            pdfs.append(buf)
+        return pdfs, labels, bookmarks
+
+    pdfs, labels, bookmarks = full_pass()
+    # Anything the last capture had that this one lacks may simply not have
+    # loaded (an ArcGIS map legend, Sep 2026): print again, waiting on those
+    # lines. What is still missing was removed.
+    lost = lost_lines(prev, record) if prev else {}
+    if lost:
+        print(f"  {sum(map(len, lost.values()))} line(s) of the last capture missing — taking a second look")
+        pdfs, labels, bookmarks = full_pass(lost)
     if prev:                                     # re-diff against what will actually be stored
         _, diff_text = diff_captures(prev, record)
         if not diff_text:
