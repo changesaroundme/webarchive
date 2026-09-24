@@ -5,13 +5,14 @@
 #   ./run.sh https://example.org/page --force
 # Nothing runs natively: Chromium and Python live in the image; this checkout,
 # the vault's Web Archive folder and the calendars checkout are bind-mounted.
-# CAM_ARCHIVE_ROOT / CAM_CALENDARS_REPO in the environment override the two
-# default folders.
+# CAM_ARCHIVE_ROOT / CAM_CALENDARS_REPO / CAM_VAULT_ROOT in the environment
+# override the default folders.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 IMAGE=cam-webarchive
 ARCHIVE="${CAM_ARCHIVE_ROOT:-$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Archive - Changes Around Me/Tooling/Web Archive}"
 CALENDARS="${CAM_CALENDARS_REPO:-$(cd "$HERE/../calendars" && pwd)}"
+VAULT="${CAM_VAULT_ROOT:-$HOME/Obsidian Sync/Changes Around Me}"     # Organizations/ pages get their link tables refreshed
 export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
 
 command -v container >/dev/null || { echo "Apple's container tool is not installed (https://github.com/apple/container/releases)"; exit 1; }
@@ -43,9 +44,13 @@ if [ -f "$R2_ENV" ]; then
         env_args+=(--env "$line")
     done < "$R2_ENV"
 fi
+# The vault's Organizations folder is optional: when it is here, batch runs
+# end by filling the Checked / Last changed / capture cells of its link tables.
+vol_args=()
+[ -d "$VAULT/Organizations" ] && vol_args+=(--volume "$VAULT/Organizations:/vault/Organizations")
 set +e
 # (bash 3.2 on macOS: an empty array is "unbound" under set -u, hence the idiom)
-container run --rm --cpus 2 --memory 4g ${env_args[@]+"${env_args[@]}"} \
+container run --rm --cpus 2 --memory 4g ${env_args[@]+"${env_args[@]}"} ${vol_args[@]+"${vol_args[@]}"} \
     --volume "$HERE:/app:ro" \
     --volume "$ARCHIVE:/archive" \
     --volume "$CALENDARS:/calendars" \

@@ -219,6 +219,35 @@ prints `failed to send signal: ["signal": 28 …` once per event. Signal 28 is t
 terminal-resize signal; the runtime does not forward it, nothing in the run is affected,
 and the daily job (no terminal) never sees it.
 
+## The organisation pages in the vault
+
+The vault's `Organizations/<name>.md` pages are written by hand and carry link tables:
+
+    | Page | Checked | Last changed |
+    | --- | --- | --- |
+    | [Service changes](https://www.capmetro.org/servicechange) | – | – |
+
+`orgpages.py` fills the cells that are facts about monitoring and touches nothing
+else. It runs at the end of every batch (`--all` / `--due`) when the vault's
+`Organizations` folder is mounted (run.sh mounts it from `~/Obsidian Sync/Changes
+Around Me`; `CAM_VAULT_ROOT` overrides), and on its own with `./run.sh --pages`
+(`--dry-run` to see what would change). A row is matched to the registry by the URL of
+the first link in its first cell, with the build's own URL matcher, so a page name can
+be anything and child pages fold into their parent. Matched rows get **Checked** (newest
+of the build's fetch and the archive job's visit), **Last changed** (newest of the build's
+content change and the newest capture of a page captured more than once — or "None since
+<date>" when no change has been seen since watching began: the `since` stamps in
+`status.json` and `captures.json`), and the captures: in an **Archive** column when the
+table has one, otherwise as dated links under the page name, one per day, newest first,
+three at most — only once a page has two or more captures (a capture is taken only when
+the text changed, and duplicates — a widget that loaded late, screen-reader-only text —
+are moved to `_to_delete/` by hand). A row whose URL is not in the registry (a dead link, a reference)
+is left exactly as it is and listed in the output, as are registry pages that appear on
+no organisation page. A cell with nothing to put in it keeps whatever placeholder is
+there. Tables without a Checked column (board members, say) are ignored. The build's
+`status.json` is read from GitHub so Checked is current even when the local checkout is
+behind; the local copy is the fallback.
+
 ## Linked pages kept as PDFs
 
 Some links are pages rather than files but belong with a page's documents: PublicInput
@@ -265,9 +294,24 @@ capture and document with its public URL, from which the build renders `docs/arc
 — the vault's *Archive* page, one section per page with the latest link, the dated
 captures and the files. Commit both after a run.
 
+Removing things from the bucket. The sync never deletes on its own. To take a capture
+or document out of the archive, move it into the archive root's `_to_delete/` folder
+(inside a folder named after its page folder, or loose), then run
+
+    ./run.sh --sync --prune-deleted --dry-run      # lists what would go
+    ./run.sh --sync --prune-deleted
+
+which deletes the bucket objects those files were uploaded as (and a page's `latest.pdf`
+when nothing of that page is left), rewrites `archive.json` without them, and says when
+`_to_delete/` can be emptied in Finder. Only keys a file in `_to_delete/` maps to are
+removed, and never one a live file also maps to. Empty `_to_delete/` only after a
+non-dry run: once the files are gone, nothing maps to their keys any more.
+
 `--purge-old-keys` deletes objects under the first key scheme (September 2026:
-`<stamp> - <title>.pdf` and `attachments/`); it was a one-off after the re-key and needs
-a token with delete permission. Nothing else in the sync deletes.
+`<stamp> - <title>.pdf` and `attachments/`); it was a one-off after the re-key.
+
+The bucket root also holds `favicon.ico`, uploaded by hand in the Cloudflare dashboard;
+the sync ignores files at the root.
 
 Settings live in `~/.config/cam-webarchive/r2.env` (`KEY=value` lines, `chmod 600`;
 `run.sh` passes them into the container, and the file is outside the repo):
@@ -279,7 +323,7 @@ Settings live in `~/.config/cam-webarchive/r2.env` (`KEY=value` lines, `chmod 60
     R2_PUBLIC_URL=https://<custom domain or r2.dev host>
 
 The API token should be scoped to that one bucket with object read + write (Cloudflare's
-"Object Read & Write" includes delete, which only `--purge-old-keys` uses). Without
+"Object Read & Write" includes delete, which only `--prune-deleted` and `--purge-old-keys` use). Without
 `R2_PUBLIC_URL` the sync still uploads but writes no URLs.
 
 The same image is what a cloud runner (GitHub Actions) or a home server would use;

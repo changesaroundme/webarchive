@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mirror the web archive into Cloudflare R2 (or any S3-compatible bucket).
 
-    python r2sync.py [--dry-run] [--verify] [--purge-old-keys]
+    python r2sync.py [--dry-run] [--verify] [--prune-deleted] [--purge-old-keys]
 
 Every capture PDF and every downloaded document goes up once, under a key
 that never changes and is never overwritten — the bucket is an append-only
@@ -28,8 +28,19 @@ Configuration is environment only (never in the repo; run.sh passes it from
 
 After a sync two files next to captures.json describe the bucket for the
 calendars build: captures.json gains each page's `url` (its latest.pdf), and
-docs/archive.json lists every capture and document with its public URL, from
-which the build renders the vault's Archive page. `--purge-old-keys` deletes
+docs/archive.json lists every capture and document with its public URL (and,
+per capture, how many text lines it changed against the one before — for
+information only), from
+which the build renders the vault's Archive page and orgpages.py fills the
+organisation pages.
+
+Deleting: the sync itself never deletes. A capture or document taken out of
+the archive goes into the archive root's `_to_delete/` folder (by page
+folder, or loose); `--prune-deleted` then removes the bucket objects those
+files were uploaded as — and a page's latest.pdf when nothing of it is left —
+after which `_to_delete/` can be emptied in Finder. Only keys that a file in
+`_to_delete/` maps to are ever removed, and never one a live file also maps
+to, so a wrong archive path cannot empty the bucket. `--purge-old-keys` deletes
 objects under the first key scheme (Sep 2026: `<stamp> - <title>.pdf` and
 `attachments/`) — a one-off after the re-key.
 """
@@ -113,6 +124,58 @@ def plan(root: Path, captures: dict) -> list[dict]:
     return out
 
 
+def deleted_keys(root: Path, captures: dict) -> set[str]:
+    """The bucket keys of the files in <root>/_to_delete/: page folders are
+    mapped like live ones (plan), loose capture PDFs by their title's page
+    folder."""
+    trash = root / "_to_delete"
+    if not trash.is_dir():
+        return set()
+    keys = {item["key"] for item in plan(trash, captures)}
+    folder_slug = {v.get("folder"): slug for slug, v in captures.get("sources", {}).items() if v.get("folder")}
+    for pdf in trash.glob("*.pdf"):
+        m = STAMP_RE.match(pdf.name)
+        if m:
+            folder = m.group(1)
+            keys.add(f"{folder_slug.get(folder) or '_unlisted/' + folder}/{m.group(2)}-{m.group(3)}.pdf")
+    return keys
+
+
+def _delete(s3, bucket: str, keys: list[str], dry_run: bool) -> None:
+    for i in range(0, len(keys), 1000):
+        chunk = keys[i:i + 1000]
+        if dry_run:
+            for k in chunk:
+                print(f"  would delete {k}")
+        else:
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": True})
+            for k in chunk:
+                print(f"  deleted {k}")
+
+
+def changed_lines(pdf: Path) -> int | None:
+    """How much a capture differs from the one before it: the number of added
+    and removed text lines in the changes.diff the capture carries. None for a
+    first capture (no diff) or a file that cannot be read. Informational:
+    recorded in archive.json so the size of each change can be seen later."""
+    try:
+        import pikepdf
+        with pikepdf.open(pdf) as doc:
+            if "changes.diff" not in doc.attachments:
+                return None
+            text = doc.attachments["changes.diff"].get_file().read_bytes().decode("utf-8", "replace")
+    except Exception:
+        return None
+    # The diff names the capture it was taken against ("# vs <file>"). When
+    # that capture has since been removed (a defective one moved to
+    # _to_delete/), this one is the page's baseline now, not a revision of it.
+    first = text.split("\n", 1)[0]
+    if first.startswith("# vs ") and not (pdf.parent / first[5:].strip()).exists():
+        return None
+    return sum(1 for l in text.splitlines()
+               if l[:1] in "+-" and not l.startswith(("+++", "---")) and l[1:].strip())
+
+
 def public_url(key: str) -> str:
     base = os.environ.get("R2_PUBLIC_URL", "").rstrip("/")
     return f"{base}/{quote(key)}" if base else ""
@@ -128,7 +191,7 @@ def _put(s3, bucket, path: Path, key: str, dry_run: bool, verb: str = "upload") 
 
 
 def sync(root: Path, captures_path: Path, dry_run: bool = False, verify: bool = False,
-         purge_old: bool = False) -> None:
+         purge_old: bool = False, prune_deleted: bool = False) -> None:
     captures = json.loads(captures_path.read_text()) if captures_path.exists() else {"sources": {}}
     archive_path = captures_path.parent / "archive.json"
     try:
@@ -164,15 +227,23 @@ def sync(root: Path, captures_path: Path, dry_run: bool = False, verify: bool = 
             _put(s3, bucket, item["path"], latest_key, dry_run, verb="refresh")
             refreshed += 1
 
+    if prune_deleted:
+        live = {item["key"] for item in todo}
+        doomed = deleted_keys(root, captures) - live
+        live_slugs = {item["slug"] for item in todo if item["kind"] == "capture"}
+        slug_of = lambda k: k.split("/files/")[0] if "/files/" in k else k.rsplit("/", 1)[0]
+        doomed |= {f"{slug_of(k)}/latest.pdf" for k in doomed if slug_of(k) not in live_slugs}
+        gone = sorted(k for k in doomed if k in have)
+        _delete(s3, bucket, gone, dry_run)
+        absent = sorted(k for k in doomed if k not in have and not k.endswith("/latest.pdf"))
+        for k in absent:
+            print(f"  (not in the bucket: {k} — never uploaded, nothing to delete)")
+        print(f"  _to_delete: {len(gone)} bucket object(s) {'to delete' if dry_run else 'deleted'}"
+              + ("" if dry_run else " — _to_delete/ can now be emptied"))
+
     if purge_old:
         old = [k for k in have if OLD_SCHEME_RE.search(k)]
-        for i in range(0, len(old), 1000):
-            chunk = old[i:i + 1000]
-            if dry_run:
-                for k in chunk:
-                    print(f"  would delete {k}")
-            else:
-                s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": True})
+        _delete(s3, bucket, old, dry_run)
         print(f"  old-scheme keys {'to delete' if dry_run else 'deleted'}: {len(old)}")
 
     if not dry_run:
@@ -184,6 +255,10 @@ def sync(root: Path, captures_path: Path, dry_run: bool = False, verify: bool = 
             rec = {"stamp": item["stamp"], "url": public_url(item["key"]), "size": item["path"].stat().st_size}
             if item["kind"] == "file":
                 rec["name"] = item["name"]
+            else:
+                n = changed_lines(item["path"])
+                if n is not None:
+                    rec["changed_lines"] = n
             entry["captures" if item["kind"] == "capture" else "files"].append(rec)
         for slug, item in newest.items():
             sources.setdefault(slug, {"captures": [], "files": []})
@@ -213,4 +288,4 @@ if __name__ == "__main__":
                                                        / "Archive - Changes Around Me/Tooling/Web Archive"))
     cal = Path(os.environ.get("CAM_CALENDARS_REPO") or Path(__file__).resolve().parent.parent / "calendars")
     sync(root, cal / "docs" / "captures.json", dry_run="--dry-run" in flags, verify="--verify" in flags,
-         purge_old="--purge-old-keys" in flags)
+         purge_old="--purge-old-keys" in flags, prune_deleted="--prune-deleted" in flags)

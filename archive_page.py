@@ -39,9 +39,13 @@ Options:
                         interval tightens to daily. Both modes write calendars/docs/captures.json
                         (per slug: last checked, newest capture) for the public sources table.
     --registry=FILE     sources.yaml to read (default: ../calendars/sources.yaml next to this repo)
+    --pages             refresh the Checked / Last changed / capture cells on the vault's
+                        Organizations pages from the registry and the generated files
+                        (orgpages.py); batch runs do this at the end when the vault is mounted
     --sync              only mirror the archive to object storage (r2sync.py; needs the R2_*
                         settings) — with --dry-run to list what would upload, --verify to
-                        compare sizes of what is already there
+                        compare sizes of what is already there, --prune-deleted to delete
+                        from the bucket what has been moved into the archive's _to_delete/
     --verbose           in batch mode, print the full per-tab diffs and every unchanged document
                         as a single-page run does (batch output is one line per tab and per
                         saved or failed file; the full diff is always inside the PDF)
@@ -111,6 +115,7 @@ ARCHIVE_ROOT = Path(os.environ.get("CAM_ARCHIVE_ROOT") or ARCHIVE_TOOLING / "Web
 # generated sources table can show an Archive column.
 CALENDARS_REPO = Path(os.environ.get("CAM_CALENDARS_REPO") or Path(__file__).resolve().parent.parent / "calendars")
 REGISTRY = CALENDARS_REPO / "sources.yaml"
+VAULT_ROOT = Path(os.environ.get("CAM_VAULT_ROOT") or Path.home() / "Obsidian Sync" / "Changes Around Me")
 CAPTURES = CALENDARS_REPO / "docs" / "captures.json"
 CHECK_INTERVALS = {"twice daily": 0.5, "daily": 1, "weekly": 7, "monthly": 30}
 CHECK_EVERY_RE = re.compile(r"every (\d+) (day|week|month)s?", re.IGNORECASE)
@@ -1389,6 +1394,9 @@ def run_batch(due_only, opts, registry_path=REGISTRY, captures_path=CAPTURES):
             if name:
                 entry["captured"] = utc_stamp(when.astimezone())
                 entry["file"] = name
+        # When watching began — set once, never moved: removing a duplicate
+        # capture must not make the page look newly watched ("None since").
+        entry.setdefault("since", entry.get("captured") or entry["checked"])
         captures["sources"][slug] = entry
         print()
     captures["generated"] = utc_stamp(datetime.now())
@@ -1404,6 +1412,14 @@ def run_batch(due_only, opts, registry_path=REGISTRY, captures_path=CAPTURES):
             r2sync.sync(ARCHIVE_ROOT, captures_path)
         except Exception as e:
             print(f"R2 sync failed (captures are safe locally): {e}")
+    # The vault's Organizations pages carry these times in their link tables;
+    # refresh them from what was just written (orgpages.py) when the vault is here.
+    if (VAULT_ROOT / "Organizations").is_dir():
+        try:
+            import orgpages
+            orgpages.refresh(VAULT_ROOT, CALENDARS_REPO)
+        except Exception as e:
+            print(f"Organisation pages not refreshed: {e}")
     checked = len(pages) - len(skipped)
     print(f"Done: {len(written)} updated, {checked - len(written) - len(failed)} unchanged, "
           f"{len(failed)} failed, {len(skipped)} not due")
@@ -1451,10 +1467,15 @@ def main():
         fetch_files(folder, args[1:], cap_mb=None, verify=opts["verify"])   # explicit list: no cap
         return
 
+    if "--pages" in flags:
+        import orgpages
+        orgpages.refresh(VAULT_ROOT, CALENDARS_REPO, dry_run="--dry-run" in flags)
+        return
     if "--sync" in flags:
         import r2sync
         r2sync.sync(ARCHIVE_ROOT, CALENDARS_REPO / "docs" / "captures.json",
-                    dry_run="--dry-run" in flags, verify="--verify" in flags)
+                    dry_run="--dry-run" in flags, verify="--verify" in flags,
+                    purge_old="--purge-old-keys" in flags, prune_deleted="--prune-deleted" in flags)
         return
 
     if "--all" in flags or "--due" in flags:

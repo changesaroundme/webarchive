@@ -22,6 +22,7 @@ RUN fc-cache -f
 # time, so the container keeps Austin's clock.
 ENV CAM_ARCHIVE_ROOT=/archive \
     CAM_CALENDARS_REPO=/calendars \
+    CAM_VAULT_ROOT=/vault \
     TZ=America/Chicago \
     PYTHONUNBUFFERED=1
 
