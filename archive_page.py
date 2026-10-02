@@ -68,6 +68,7 @@ import base64
 import difflib
 import hashlib
 import io
+import html
 import json
 import os
 import re
@@ -149,7 +150,12 @@ EXPAND_JS = """
   // at a time — so panels are forced open structurally, never by clicking):
   for (const b of content.querySelectorAll('[class*="accordion"] [aria-expanded="false"], [data-melodeon-btn][aria-expanded="false"]')) {
     b.setAttribute('aria-expanded', 'true');
-    const p = (b.getAttribute('aria-controls') && document.getElementById(b.getAttribute('aria-controls'))) || b.nextElementSibling;
+    // panel id: aria-controls, or Bootstrap-style data-target/href (austintexas.gov's
+    // Cohesion accordion tabs: <a aria-expanded="false" data-target="#id">)
+    const href = b.getAttribute('href') || '';
+    const ref = b.getAttribute('aria-controls') || b.getAttribute('data-target') || b.getAttribute('data-bs-target') || (href.startsWith('#') ? href : '');
+    const id = ref.replace(/^#/, '');
+    const p = (id && document.getElementById(id)) || b.nextElementSibling;
     if (!p) continue;
     p.hidden = false;
     p.style.setProperty('display', 'block', 'important');
@@ -203,6 +209,14 @@ GENERIC_PREP_JS = """
   const q = (s) => [...document.querySelectorAll(s)];
   q('.ckeditor-accordion-container dt').forEach(d => d.classList.add('active'));   // Drupal accordions (austintexas.gov)
   q('.ckeditor-accordion-container dd').forEach(d => d.style.display = 'block');
+  // Elementor tabs and toggles (WordPress; thetrailconservancy.org): every pane is
+  // shown, stacked under its own title. Elementor already puts a mobile-layout title
+  // before each pane, so those are shown and the desktop tab strip is hidden —
+  // otherwise "Phase 1 Phase 2 Phase 3" would print once as a bar with no panes under it.
+  q('.elementor-tabs-wrapper').forEach(w => w.style.setProperty('display', 'none', 'important'));
+  q('.elementor-tab-mobile-title').forEach(t => { t.style.setProperty('display', 'block', 'important'); t.classList.add('elementor-active'); });
+  q('.elementor-toggle-title').forEach(t => t.classList.add('elementor-active'));
+  q('.elementor-tab-content').forEach(c => { c.hidden = false; c.style.setProperty('display', 'block', 'important'); });
   (""" + EXPAND_JS.strip() + """)(document.body);
   // overlays (lightboxes, dialogs, cookie banners) must be hidden, not pinned into the
   // flow — but never the page itself: WordPress's Cookie Notice plugin puts a
@@ -885,18 +899,48 @@ def unwrap_safelink(href):
     return unquote(m.group(1)) if m else href
 
 
+# Links that stand in front of a document rather than being one. Office's
+# web viewer wraps the real URL in `src=` (Shape Austin's 2026 Bond); a Widen
+# share page (austin.widen.net/s/<id>/<name>, the City's asset library — the
+# I-35 Central SAMP final plan, the Barton Springs bridge report) is an HTML
+# viewer whose Download button points at /content/<other id>/original/<file>,
+# so it is resolved when fetched (resolve_share_page).
+OFFICE_VIEWER_RE = re.compile(r"^https://view\.officeapps\.live\.com/op/(?:view|embed)\.aspx\?(?:.*&)?src=([^&]+)", re.IGNORECASE)
+WIDEN_SHARE_RE = re.compile(r"^https://[\w-]+\.widen\.net/s/\w+/", re.IGNORECASE)
+WIDEN_DOWNLOAD_RE = re.compile(r'href="(/content/[^"]+/original/[^"]+)"')
+
+
+def unwrap_viewer(href):
+    m = OFFICE_VIEWER_RE.match(href)
+    return unquote(m.group(1)) if m else href
+
+
+def resolve_share_page(req, url):
+    """A Widen share page -> the direct download URL of its file, or None."""
+    r = req.get(url, timeout=30000)
+    if not r.ok:
+        return None
+    m = WIDEN_DOWNLOAD_RE.search(r.text())
+    if not m:
+        return None
+    base = re.match(r"^https://[^/]+", url).group(0)
+    return base + html.unescape(m.group(1))
+
+
 def documents_from(record):
     """{href: preferred filename} of the documents a capture links to: PublicInput's
     curated Documents list, plus any content link (not header/nav/footer) whose target
-    has a document extension or looks like a download endpoint. The download step
-    HEADs the latter and drops anything that isn't served as a document."""
+    has a document extension, looks like a download endpoint or is a document share
+    page (Widen; Office's web viewer is unwrapped to the file it shows). The download
+    step HEADs the latter and drops anything that isn't served as a document."""
     docs = {}
     for tab in record.get("tabs", []):
         for link in tab.get("links", []):
-            href, text = unwrap_safelink(link["href"]), link.get("text", "")
+            href, text = unwrap_viewer(unwrap_safelink(link["href"])), link.get("text", "")
             if "/Customer/File/Full/" in href:
                 docs.setdefault(href, text)
-            elif not link.get("chrome") and (DOC_EXT_RE.search(href) or DOC_HINT_RE.search(href)):
+            elif not link.get("chrome") and (DOC_EXT_RE.search(href) or DOC_HINT_RE.search(href)
+                                             or WIDEN_SHARE_RE.match(href)):
                 docs.setdefault(href, None)      # keep the server's filename
     return docs
 
@@ -977,8 +1021,17 @@ def sync_docs(out_dir, record, all_docs=False, verify=False):
     over = 0
     if docs:
         print(f"Documents: {len(docs)} linked")
-        over = fetch_files(out_dir / "Attachments", [(u, n) for u, n in docs.items()],
-                           cap_mb=None if all_docs else DOC_CAP_MB, verify=verify)
+        # PublicInput's own Documents list is curated by the project team and
+        # holds renderings and maps as well as PDFs (Rail and Trail, Sep 2026):
+        # images from it are kept; elsewhere an image link is not a document.
+        curated = [(u, n) for u, n in docs.items() if "/Customer/File/Full/" in u]
+        other = [(u, n) for u, n in docs.items() if "/Customer/File/Full/" not in u]
+        cap = None if all_docs else DOC_CAP_MB
+        if curated:
+            over += fetch_files(out_dir / "Attachments", curated, cap_mb=cap, verify=verify,
+                                types=DOC_TYPES + ("image/",))
+        if other:
+            over += fetch_files(out_dir / "Attachments", other, cap_mb=cap, verify=verify)
     if slides:
         print(f"Slides: {len(slides)} in the app's carousels")
         over += fetch_files(out_dir / "Attachments", slides, cap_mb=None if all_docs else DOC_CAP_MB,
@@ -1285,16 +1338,29 @@ def fetch_files(folder, items, cap_mb=None, verify=False, types=DOC_TYPES):
     with sync_playwright() as p:
         req = p.request.new_context(user_agent="Mozilla/5.0 (Macintosh) archive_page.py")
         plan = []          # (url, preferred, probe) still to download
+        resolved = {}      # share-page URL -> the file's own URL
         for item in items:
             url, preferred = item if isinstance(item, tuple) else (item, None)
             if drive_download_url(url):
                 plan.append((url, preferred, None))       # Drive answers HEAD with HTML; just download
                 continue
-            probe = _probe(req, url)
+            target = url
+            if WIDEN_SHARE_RE.match(url):
+                try:
+                    target = resolve_share_page(req, url)
+                except Exception as e:
+                    target, why = None, e
+                else:
+                    why = "share page has no download link"
+                if not target:
+                    _doc_failed(folder, url, why)
+                    continue
+                resolved[url] = target                # the index keeps the share URL; this run fetches the file
+            probe = _probe(req, target)
             if not probe["ok"]:
                 _doc_failed(folder, url, f"HTTP {probe['status']}")
                 continue
-            if not DOC_EXT_RE.search(url) and not probe["type"].startswith(types):
+            if not DOC_EXT_RE.search(target) and not probe["type"].startswith(types):
                 continue                                   # a download-looking link that serves HTML
             entry = index.get(url)
             if entry and (folder / entry["name"]).exists():
@@ -1323,7 +1389,7 @@ def fetch_files(folder, items, cap_mb=None, verify=False, types=DOC_TYPES):
         for url, preferred, probe in plan:
             try:
                 drive = drive_download_url(url)
-                r = req.get(drive or url, timeout=120000)
+                r = req.get(drive or resolved.get(url, url), timeout=120000)
                 if drive and r.ok and "text/html" in r.headers.get("content-type", ""):
                     # big-file confirm page: replay its form (virus-scan bypass)
                     body = r.text()
@@ -1337,7 +1403,7 @@ def fetch_files(folder, items, cap_mb=None, verify=False, types=DOC_TYPES):
                 cd = r.headers.get("content-disposition", "")
                 m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", cd)
                 name = (m.group(1) if m else preferred
-                        or url.split("?")[0].rstrip("/").split("/")[-1] or "download")
+                        or resolved.get(url, url).split("?")[0].rstrip("/").split("/")[-1] or "download")
                 name = re.sub(r"[^\w.\- ()]+", "_", unquote(name))
                 data = r.body()
                 digest = hashlib.sha256(data).hexdigest()
