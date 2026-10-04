@@ -357,8 +357,17 @@ sidebar chrome) and either has a document extension (`.pdf`, `.docx`, `.xlsx`,
 `.pptx`, `.zip`, `.kmz`, `.csv`) or looks like a download endpoint (`/download/`,
 `?wpdmdl=`, `document.cfm`, `/documents/`…) and answers a HEAD request with a
 document content-type. A PublicInput page's curated **Documents** list is
-included as before. Files land in the page's `Attachments/` subfolder, keeping
-the server's filename; `--no-docs` turns this off.
+included as before, images too (project teams post renderings and maps there).
+Links that stand in front of a document are followed to it: Outlook safelinks
+and Office's web viewer (`view.officeapps.live.com/…?src=`) are unwrapped, and a
+Widen share page (`austin.widen.net/s/<id>/<name>`, the City's asset library) is
+opened for the address behind its Download button — the index still records the
+share link, so a revised file behind the same link is noticed. Files land in the
+page's `Attachments/` subfolder, keeping the server's filename; `--no-docs` turns
+this off. Not followed (Sep 2026): Adobe Acrobat share links (an app, not a
+file), Box shared-folder pages, and dead links — the Airport page's e-Builder
+"Download PDF" returns a server error on e-Builder's side. Links that fail are
+listed under "Documents not fetched" at the end of a run.
 
 Re-checks are cheap by default: `Attachments/.index.json` records each URL's file
 name, size, ETag, Last-Modified and SHA-256, and a later run only HEADs each URL —
