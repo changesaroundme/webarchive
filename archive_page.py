@@ -77,7 +77,7 @@ import time
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 from playwright.sync_api import sync_playwright
 import pikepdf
@@ -675,7 +675,7 @@ def _doc_failed(folder, url, reason):
 
 def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
             original_hero=False, force=False, fetch_docs=True, all_docs=False, verify=False,
-            root=None):
+            root=None, docs="all"):
     """Capture one page, then bring its linked documents up to date. Returns
     the written path, or None when unchanged. out_dir is this page's folder;
     root (batch mode) is the archive root the page-title folder goes under.
@@ -685,7 +685,7 @@ def archive(url, explicit_out=None, out_dir=None, width=PAGE_WIDTH_PX,
     "Sync API inside the asyncio loop"."""
     written, record, folder = _capture(url, explicit_out, out_dir, width, original_hero, force, root)
     if fetch_docs and record is not None:
-        _over_cap(url, sync_docs(folder, record, all_docs, verify))
+        _over_cap(url, sync_docs(folder, record, all_docs, verify, docs))
     return written
 
 
@@ -927,16 +927,38 @@ def resolve_share_page(req, url):
     return base + html.unescape(m.group(1))
 
 
-def documents_from(record):
+# Translations a page offers beside its English documents, skipped when the
+# registry row says `docs: english` (CapMetro's Transit Plan 2035 page carries
+# every PDF in Spanish too, Oct 2026). Judged by the link's text or the file's
+# name; English is the default on these sites and goes unmarked, so only the
+# other languages need recognising.
+TRANSLATION_TEXT_RE = re.compile(
+    r"espa[ñn]ol|spanish|vietnam|tiếng việt|chinese|中文|korean|한국|arabic|العربية"
+    r"|fran[çc]ais|french|hindi|हिन्दी|burmese|urdu|\(es\)|\(vi\)|\(zh\)|\(ko\)|\(ar\)", re.IGNORECASE)
+TRANSLATION_FILE_RE = re.compile(
+    r"(?:^|[-_.(])(esp|espanol|español|spanish|vietnamese|chinese|korean|arabic|french)(?=[-_.)]|$)"
+    r"|[-_](es|vi|zh|ko)\.(?:pdf|docx?|xlsx?|pptx?)$", re.IGNORECASE)   # not ar/fr: "_ar" is too common
+
+
+def is_translation(text, href):
+    """Does this link point at a non-English version of a document?"""
+    name = unquote(urlparse(href).path.rsplit("/", 1)[-1])
+    return bool(TRANSLATION_TEXT_RE.search(text or "") or TRANSLATION_FILE_RE.search(name))
+
+
+def documents_from(record, english_only=False):
     """{href: preferred filename} of the documents a capture links to: PublicInput's
     curated Documents list, plus any content link (not header/nav/footer) whose target
     has a document extension, looks like a download endpoint or is a document share
     page (Widen; Office's web viewer is unwrapped to the file it shows). The download
-    step HEADs the latter and drops anything that isn't served as a document."""
+    step HEADs the latter and drops anything that isn't served as a document.
+    english_only drops translations (see is_translation)."""
     docs = {}
     for tab in record.get("tabs", []):
         for link in tab.get("links", []):
             href, text = unwrap_viewer(unwrap_safelink(link["href"])), link.get("text", "")
+            if english_only and is_translation(text, href):
+                continue
             if "/Customer/File/Full/" in href:
                 docs.setdefault(href, text)
             elif not link.get("chrome") and (DOC_EXT_RE.search(href) or DOC_HINT_RE.search(href)
@@ -1008,12 +1030,12 @@ def capture_linked_pages(folder, pages, width=PAGE_WIDTH_PX):
     _save_index(folder, index)
 
 
-def sync_docs(out_dir, record, all_docs=False, verify=False):
+def sync_docs(out_dir, record, all_docs=False, verify=False, docs="all"):
     """Bring Attachments/ up to date with the documents a capture links to.
     Runs on every capture, changed or not: unchanged pages cost one HEAD per
     file; new or revised files are downloaded. Over the cap, nothing is fetched
     unless --all-docs. Returns the over-cap MB, or 0."""
-    docs = documents_from(record)
+    docs = documents_from(record, english_only=(docs == "english"))
     pages = linked_pages_from(record)
     slides = exb_slides(record.get("url", ""))
     if not docs and not pages and not slides:
@@ -1514,7 +1536,7 @@ def run_batch(due_only, opts, registry_path=REGISTRY, captures_path=CAPTURES):
         LAST.clear()
         checked_at = datetime.now()
         try:
-            result = archive(r["url"], **opts)
+            result = archive(r["url"], **dict(opts, docs=r.get("docs") or "all"))
         except Exception as e:
             # Where it broke, in one line: the summary is all a scheduled run leaves behind.
             import traceback

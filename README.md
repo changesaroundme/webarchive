@@ -369,6 +369,14 @@ file), Box shared-folder pages, and dead links — the Airport page's e-Builder
 "Download PDF" returns a server error on e-Builder's side. Links that fail are
 listed under "Documents not fetched" at the end of a run.
 
+A registry row with `docs: english` skips the translations a page offers beside
+its English documents (CapMetro's Transit Plan 2035 has every PDF in Spanish
+too). A link is taken for a translation when its text names a language other
+than English (español, Vietnamese, 中文, …) or its file name carries a language
+tag (`_esp`, `(espanol)`, `_spanish`, `-es.pdf`, `-vi.pdf`). English is unmarked
+on these sites, so nothing is needed to recognise it. The default, `docs: all`,
+downloads everything.
+
 Re-checks are cheap by default: `Attachments/.index.json` records each URL's file
 name, size, ETag, Last-Modified and SHA-256, and a later run only HEADs each URL —
 skipped when the ETag matches (or, without one, size + Last-Modified, else size).
