@@ -360,14 +360,17 @@ document content-type. A PublicInput page's curated **Documents** list is
 included as before, images too (project teams post renderings and maps there).
 Links that stand in front of a document are followed to it: Outlook safelinks
 and Office's web viewer (`view.officeapps.live.com/…?src=`) are unwrapped, and a
-Widen share page (`austin.widen.net/s/<id>/<name>`, the City's asset library) is
+Widen share page or inline viewer (`austin.widen.net/s/<id>/<name>` and
+`austin.widen.net/view/pdf/<id>/<name>.pdf`, the City's asset library) is
 opened for the address behind its Download button — the index still records the
 share link, so a revised file behind the same link is noticed. Files land in the
 page's `Attachments/` subfolder, keeping the server's filename; `--no-docs` turns
 this off. Not followed (Sep 2026): Adobe Acrobat share links (an app, not a
 file), Box shared-folder pages, and dead links — the Airport page's e-Builder
 "Download PDF" returns a server error on e-Builder's side. Links that fail are
-listed under "Documents not fetched" at the end of a run.
+listed under "Documents not fetched" at the end of a run — including a link that
+answers with a web page instead of a document (a viewer, a login wall, a bot
+check): nothing is saved for it.
 
 A registry row with `docs: english` skips the translations a page offers beside
 its English documents (CapMetro's Transit Plan 2035 has every PDF in Spanish
@@ -383,6 +386,8 @@ skipped when the ETag matches (or, without one, size + Last-Modified, else size)
 `--verify` downloads everything and compares SHA-256 instead. A file already on
 disk from before the index existed is adopted when its size matches. A revised
 file never overwrites: the new version is saved with a date stamp beside the old.
+A download is compared with the last version saved for its own link first, so two
+links that share a file name do not produce a new copy every run.
 
 New downloads for one page are capped at 500 MB (`DOC_CAP_MB`) so a routine
 `--all` never surprises you with a multi-gigabyte pull (an EIS with appendices is
@@ -436,6 +441,18 @@ the site. A real removal costs that wait once, on the run that records it. Renam
 Dynamic UI noise (comment counters, "N characters remaining", relative
 timestamps) is filtered via `NOISE_PATTERNS` at the top of the script — add a
 pattern there when a false positive shows up.
+
+## Tests
+
+    python3 tests/test_documents.py
+
+checks the linked-file downloader without touching the network or needing
+anything installed: Widen viewer pages (two real ones in `fixtures/`) resolve to
+the file behind them, a link that answers with a web page saves nothing and is
+reported, a second run saves nothing new, and a real revision is still caught.
+When the archive folder is reachable it also confirms that no web page sits
+among the saved documents — the state the Nov 2026 viewer bug left behind
+(1,232 of them). Run it after any change to `fetch_files`.
 
 ## Notes
 

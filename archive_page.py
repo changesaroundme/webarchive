@@ -904,10 +904,15 @@ def unwrap_safelink(href):
 # share page (austin.widen.net/s/<id>/<name>, the City's asset library — the
 # I-35 Central SAMP final plan, the Barton Springs bridge report) is an HTML
 # viewer whose Download button points at /content/<other id>/original/<file>,
-# so it is resolved when fetched (resolve_share_page).
+# so it is resolved when fetched (resolve_share_page). Widen's inline viewer
+# (austin.widen.net/view/pdf/<id>/<name>.pdf — the Transit Enhancement
+# Infrastructure Report, the Urban Trails Plan) is the same page under an
+# address that ends in .pdf: fetched as it stands it answers with the viewer's
+# HTML, never the file, so it is resolved the same way (Nov 2026).
 OFFICE_VIEWER_RE = re.compile(r"^https://view\.officeapps\.live\.com/op/(?:view|embed)\.aspx\?(?:.*&)?src=([^&]+)", re.IGNORECASE)
-WIDEN_SHARE_RE = re.compile(r"^https://[\w-]+\.widen\.net/s/\w+/", re.IGNORECASE)
+WIDEN_SHARE_RE = re.compile(r"^https://[\w-]+\.widen\.net/(?:s|view/pdf)/\w+/", re.IGNORECASE)
 WIDEN_DOWNLOAD_RE = re.compile(r'href="(/content/[^"]+/original/[^"]+)"')
+WIDEN_PREVIEW_RE = re.compile(r"viewerPdfUrl\s*=\s*'(https://[^']+)'")
 
 
 def unwrap_viewer(href):
@@ -916,15 +921,21 @@ def unwrap_viewer(href):
 
 
 def resolve_share_page(req, url):
-    """A Widen share page -> the direct download URL of its file, or None."""
+    """A Widen share page or inline viewer -> the direct download URL of its file, or None."""
     r = req.get(url, timeout=30000)
     if not r.ok:
         return None
-    m = WIDEN_DOWNLOAD_RE.search(r.text())
-    if not m:
-        return None
-    base = re.match(r"^https://[^/]+", url).group(0)
-    return base + html.unescape(m.group(1))
+    body = r.text()
+    m = WIDEN_DOWNLOAD_RE.search(body)
+    if m:
+        base = re.match(r"^https://[^/]+", url).group(0)
+        return base + html.unescape(m.group(1))
+    # A file published without a Download button (the FY 2026-27 Proposed Budget):
+    # the viewer then carries only the signed address of the PDF it displays. That
+    # address is different on every request and soon expires, which is fine — the
+    # index is keyed by the link, and this run fetches straight away.
+    m = WIDEN_PREVIEW_RE.search(body)
+    return m.group(1) if m else None
 
 
 # Translations a page offers beside its English documents, skipped when the
@@ -1291,6 +1302,15 @@ def drive_download_url(url):
     return f"https://drive.google.com/uc?export=download&id={m.group(1)}" if m else None
 
 
+def _is_html(data):
+    """Is a downloaded "document" really a web page? A viewer, a login wall, a
+    bot check or a soft 404 can answer a document link with HTML and a 200. None
+    of the document types kept here begins like one, so the body's first bytes
+    decide; the Content-Type header is not trusted either way."""
+    head = data[:1024].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    return head.startswith((b"<!doctype html", b"<html"))
+
+
 def _load_index(folder):
     try:
         return json.loads((folder / ".index.json").read_text())
@@ -1338,8 +1358,10 @@ def fetch_files(folder, items, cap_mb=None, verify=False, types=DOC_TYPES):
     """Download linked documents into a capture folder. Items are URLs or
     (url, preferred_name) pairs. Keeps the server's filename (else the preferred
     name); an identical file already there is skipped, a different one with the
-    same name gets a date stamp. `types` are the content types accepted for a
-    URL without a document extension. Runs through Chromium's request stack so
+    same name gets a date stamp. A link that answers with a web page instead of
+    a document is reported as failed and nothing is saved. `types` are the
+    content types accepted for a URL without a document extension. Runs through
+    Chromium's request stack so
     redirects, cookies and content-disposition behave like a browser download.
     Google Drive links (file/d/…, /preview embeds, open?id=…) are converted to
     direct downloads, including the are-you-sure page Drive serves for big files.
@@ -1373,7 +1395,7 @@ def fetch_files(folder, items, cap_mb=None, verify=False, types=DOC_TYPES):
                 except Exception as e:
                     target, why = None, e
                 else:
-                    why = "share page has no download link"
+                    why = "viewer page has no download link"
                 if not target:
                     _doc_failed(folder, url, why)
                     continue
@@ -1383,6 +1405,8 @@ def fetch_files(folder, items, cap_mb=None, verify=False, types=DOC_TYPES):
                 _doc_failed(folder, url, f"HTTP {probe['status']}")
                 continue
             if not DOC_EXT_RE.search(target) and not probe["type"].startswith(types):
+                if url in resolved and DOC_EXT_RE.search(url):   # a .pdf viewer link whose file is not served as a document
+                    _doc_failed(folder, url, f"the file behind the viewer is served as {probe['type'] or 'an unknown type'}")
                 continue                                   # a download-looking link that serves HTML
             entry = index.get(url)
             if entry and (folder / entry["name"]).exists():
@@ -1424,11 +1448,32 @@ def fetch_files(folder, items, cap_mb=None, verify=False, types=DOC_TYPES):
                     continue
                 cd = r.headers.get("content-disposition", "")
                 m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", cd)
-                name = (m.group(1) if m else preferred
-                        or resolved.get(url, url).split("?")[0].rstrip("/").split("/")[-1] or "download")
+                tail = resolved.get(url, url).split("?")[0].rstrip("/").split("/")[-1]
+                name = m.group(1) if m else preferred or tail or "download"
+                if url in resolved and not DOC_EXT_RE.search(name):
+                    link_name = url.split("?")[0].rstrip("/").split("/")[-1]
+                    if DOC_EXT_RE.search(link_name):       # a viewer's preview address drops the extension
+                        name = link_name
                 name = re.sub(r"[^\w.\- ()]+", "_", unquote(name))
                 data = r.body()
+                if _is_html(data):
+                    # Saved, it would pass for the document and — such pages differ on
+                    # every request — add a "new version" each run (the Widen viewer did
+                    # exactly that, 1,200 times, before Nov 2026).
+                    _doc_failed(folder, url, "served a web page, not a document")
+                    continue
                 digest = hashlib.sha256(data).hexdigest()
+                prev = index.get(url) or {}
+                if prev.get("sha256") == digest and prev.get("name") and (folder / prev["name"]).exists():
+                    # The bytes this URL gave last time. Checked before the filename, because
+                    # two links can share one (EDIMS serves two different files under one
+                    # name): the second lives under a stamped name and must not be saved again.
+                    unchanged += 1
+                    if VERBOSE:
+                        print(f"  unchanged: {prev['name']}" + (" (verified)" if verify else ""))
+                    index[url] = dict(prev, size=len(data), etag=r.headers.get("etag", ""),
+                                      last_modified=r.headers.get("last-modified", ""))
+                    continue
                 dest = folder / name
                 if dest.exists():
                     if hashlib.sha256(dest.read_bytes()).hexdigest() == digest:
