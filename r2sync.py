@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mirror the web archive into Cloudflare R2 (or any S3-compatible bucket).
 
-    python r2sync.py [--dry-run] [--verify] [--prune-deleted] [--purge-old-keys]
+    python r2sync.py [--dry-run] [--verify] [--prune-deleted] [--purge-old-keys] [--verbose]
 
 Every capture PDF and every downloaded document goes up once, under a key
 that never changes and is never overwritten — the bucket is an append-only
@@ -43,6 +43,13 @@ after which `_to_delete/` can be emptied in Finder. Only keys that a file in
 to, so a wrong archive path cannot empty the bucket. `--purge-old-keys` deletes
 objects under the first key scheme (Sep 2026: `<stamp> - <title>.pdf` and
 `attachments/`) — a one-off after the re-key.
+
+What a run prints: a line when it starts listing the bucket and one with what
+it found; each upload, numbered when there are several; a deletion as a count
+per page and then a running total per batch (`--verbose` lists every key
+instead). When the bucket cannot be reached, or refuses a request, the run
+stops with a short message — how far it got, and that running the same command
+again finishes the job — instead of a traceback (SyncStopped).
 """
 from __future__ import annotations
 
@@ -51,6 +58,7 @@ import mimetypes
 import os
 import re
 import sys
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -60,6 +68,45 @@ DOC_STAMP_RE = re.compile(r"^(.*) - (\d{4}-\d{2}-\d{2}) (\d{4})(\.[^.]+)?$")
 OLD_SCHEME_RE = re.compile(r"(^|/)\d{4}-\d{2}-\d{2} \d{4} - |/attachments/")
 CONTENT_TYPES = {".pdf": "application/pdf", ".kmz": "application/vnd.google-earth.kmz",
                  ".kml": "application/vnd.google-earth.kml+xml", ".csv": "text/csv"}
+
+
+DELETE_BATCH = 250          # keys per delete request (S3 allows 1,000); smaller batches report progress sooner
+
+
+class SyncStopped(Exception):
+    """The bucket could not be reached or refused a request. The message says
+    how far the sync got and what to do; nothing is ever left half-done, since
+    every run lists the bucket first and acts only on what is still different."""
+
+
+def _bucket_error(e: BaseException) -> bool:
+    """Did this come from the storage client or the network under it — as
+    opposed to a bug here or an unreadable local file, which keep their traceback?"""
+    return any(c.__module__.split(".")[0] in ("botocore", "boto3", "s3transfer", "urllib3") for c in type(e).__mro__)
+
+
+def _stopped_message(e: BaseException, done: dict, dry_run: bool) -> str:
+    reason = (str(e).strip().splitlines() or [type(e).__name__])[0][:200]
+    unreachable = any(w in (type(e).__name__ + " " + reason).lower() for w in ("connect", "timeout", "timed out", "unreachable", "resolve"))
+    changed = []
+    if done["uploaded"]:
+        changed.append(f"uploaded {done['uploaded']} of {done['to_upload']}")
+    if done["deleted"]:
+        changed.append(f"deleted {done['deleted']} of {done['to_delete']}")
+    lines = [f"R2 sync stopped while {done['step']}: " + ("could not reach the bucket" if unreachable else "the bucket refused the request")
+             + f" ({reason})"]
+    if dry_run or not changed:
+        lines.append("Nothing was changed in the bucket.")
+    else:
+        lines.append("Before stopping: " + ", ".join(changed) + ". The rest is untouched.")
+    lines.append(("Check that this computer is awake and online, then run" if unreachable else "Once that is sorted out, run")
+                 + " the same command again — a run only acts on what is still different.")
+    return "\n".join(lines)
+
+
+def _page_of(key: str) -> str:
+    """The page a bucket key belongs to: its slug, or _unlisted/<folder>."""
+    return key.split("/files/")[0] if "/files/" in key else key.rsplit("/", 1)[0]
 
 
 def _client():
@@ -141,16 +188,35 @@ def deleted_keys(root: Path, captures: dict) -> set[str]:
     return keys
 
 
-def _delete(s3, bucket: str, keys: list[str], dry_run: bool) -> None:
-    for i in range(0, len(keys), 1000):
-        chunk = keys[i:i + 1000]
+def _delete(s3, bucket: str, keys: list[str], dry_run: bool, verbose: bool = False, done: dict | None = None) -> None:
+    """Delete keys from the bucket, saying what is going and how far along it is:
+    a count per page first, then a running total after each batch. verbose lists
+    every key instead of the per-page counts."""
+    if not keys:
+        return
+    done = done if done is not None else {}
+    done["to_delete"] = done.get("to_delete", 0) + len(keys)
+    verb = "would delete" if dry_run else "deleting"
+    if verbose:
+        for k in keys:
+            print(f"  {verb} {k}")
+    else:
+        pages = Counter(_page_of(k) for k in keys)
+        print(f"  {verb} {len(keys):,} object(s) from {len(pages)} page(s):")
+        for page, n in sorted(pages.items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"    {n:>6,}  {page}")
         if dry_run:
-            for k in chunk:
-                print(f"  would delete {k}")
-        else:
-            s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": True})
-            for k in chunk:
-                print(f"  deleted {k}")
+            print("    (--verbose lists every key)")
+    if dry_run:
+        return
+    gone = 0
+    for i in range(0, len(keys), DELETE_BATCH):
+        chunk = keys[i:i + DELETE_BATCH]
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": True})
+        gone += len(chunk)
+        done["deleted"] = done.get("deleted", 0) + len(chunk)
+        if len(keys) > DELETE_BATCH:
+            print(f"  deleted {gone:,} of {len(keys):,}")
 
 
 def changed_lines(pdf: Path) -> int | None:
@@ -181,17 +247,31 @@ def public_url(key: str) -> str:
     return f"{base}/{quote(key)}" if base else ""
 
 
-def _put(s3, bucket, path: Path, key: str, dry_run: bool, verb: str = "upload") -> None:
+def _put(s3, bucket, path: Path, key: str, dry_run: bool, verb: str = "upload", count: tuple[int, int] | None = None) -> None:
     size = path.stat().st_size
+    n = f"[{count[0]}/{count[1]}] " if count and count[1] > 1 else ""
     if dry_run:
-        print(f"  would {verb} {key} ({size/1e6:.1f} MB)")
+        print(f"  {n}would {verb} {key} ({size/1e6:.1f} MB)")
     else:
         s3.upload_file(str(path), bucket, key, ExtraArgs={"ContentType": _content_type(path)})
-        print(f"  {verb}ed {key} ({size/1e6:.1f} MB)")
+        print(f"  {n}{verb}ed {key} ({size/1e6:.1f} MB)")
 
 
 def sync(root: Path, captures_path: Path, dry_run: bool = False, verify: bool = False,
-         purge_old: bool = False, prune_deleted: bool = False) -> None:
+         purge_old: bool = False, prune_deleted: bool = False, verbose: bool = False) -> None:
+    """Mirror the archive (see the module docstring). Raises SyncStopped, with a
+    message fit to show as it is, when the bucket cannot be reached or refuses."""
+    done = {"step": "starting", "uploaded": 0, "to_upload": 0, "deleted": 0, "to_delete": 0}
+    try:
+        _sync(root, captures_path, dry_run, verify, purge_old, prune_deleted, verbose, done)
+    except Exception as e:
+        if not _bucket_error(e):
+            raise
+        raise SyncStopped(_stopped_message(e, done, dry_run)) from e
+
+
+def _sync(root: Path, captures_path: Path, dry_run: bool, verify: bool, purge_old: bool,
+          prune_deleted: bool, verbose: bool, done: dict) -> None:
     captures = json.loads(captures_path.read_text()) if captures_path.exists() else {"sources": {}}
     archive_path = captures_path.parent / "archive.json"
     try:
@@ -200,9 +280,16 @@ def sync(root: Path, captures_path: Path, dry_run: bool = False, verify: bool = 
         prior_latest = {}
     bucket = os.environ["R2_BUCKET"]
     s3 = _client()
+    done["step"] = "listing the bucket"
+    print("R2: listing the bucket…", flush=True)
     have = existing_keys(s3, bucket)
     todo = plan(root, captures)
+    pending = [item for item in todo if item["key"] not in have]
+    done["to_upload"] = len(pending)
+    print(f"R2: {len(have):,} object(s) in the bucket, {len(todo):,} local file(s)"
+          + (f"; {len(pending):,} to upload ({sum(i['path'].stat().st_size for i in pending)/1e6:,.1f} MB)" if pending else ""), flush=True)
 
+    done["step"] = "uploading"
     uploaded, skipped, mismatched = 0, 0, []
     for item in todo:
         key, path = item["key"], item["path"]
@@ -211,8 +298,10 @@ def sync(root: Path, captures_path: Path, dry_run: bool = False, verify: bool = 
                 mismatched.append((key, have[key], path.stat().st_size))
             skipped += 1
             continue
-        _put(s3, bucket, path, key, dry_run)
+        _put(s3, bucket, path, key, dry_run, count=(uploaded + 1, len(pending)))
         uploaded += 1
+        if not dry_run:
+            done["uploaded"] = uploaded
 
     # latest.pdf per page: re-upload whenever the newest capture is not the one
     # the bucket's copy was made from (recorded in archive.json) or the sizes differ.
@@ -221,6 +310,7 @@ def sync(root: Path, captures_path: Path, dry_run: bool = False, verify: bool = 
         if item["kind"] == "capture" and (item["slug"] not in newest or item["stamp"] > newest[item["slug"]]["stamp"]):
             newest[item["slug"]] = item
     refreshed = 0
+    done["step"] = "refreshing latest.pdf"
     for slug, item in newest.items():
         latest_key = f"{slug}/latest.pdf"
         if prior_latest.get(slug) != item["key"] or have.get(latest_key) != item["path"].stat().st_size:
@@ -231,21 +321,26 @@ def sync(root: Path, captures_path: Path, dry_run: bool = False, verify: bool = 
         live = {item["key"] for item in todo}
         doomed = deleted_keys(root, captures) - live
         live_slugs = {item["slug"] for item in todo if item["kind"] == "capture"}
-        slug_of = lambda k: k.split("/files/")[0] if "/files/" in k else k.rsplit("/", 1)[0]
-        doomed |= {f"{slug_of(k)}/latest.pdf" for k in doomed if slug_of(k) not in live_slugs}
+        doomed |= {f"{_page_of(k)}/latest.pdf" for k in doomed if _page_of(k) not in live_slugs}
         gone = sorted(k for k in doomed if k in have)
-        _delete(s3, bucket, gone, dry_run)
+        done["step"] = "deleting from the bucket"
+        _delete(s3, bucket, gone, dry_run, verbose, done)
         absent = sorted(k for k in doomed if k not in have and not k.endswith("/latest.pdf"))
-        for k in absent:
-            print(f"  (not in the bucket: {k} — never uploaded, nothing to delete)")
+        if verbose or len(absent) <= 10:
+            for k in absent:
+                print(f"  (not in the bucket: {k} — never uploaded, nothing to delete)")
+        elif absent:
+            print(f"  ({len(absent):,} file(s) in _to_delete/ are not in the bucket — never uploaded or already deleted; nothing to do for them)")
         print(f"  _to_delete: {len(gone)} bucket object(s) {'to delete' if dry_run else 'deleted'}"
               + ("" if dry_run else " — _to_delete/ can now be emptied"))
 
     if purge_old:
         old = [k for k in have if OLD_SCHEME_RE.search(k)]
-        _delete(s3, bucket, old, dry_run)
+        done["step"] = "deleting old-scheme keys"
+        _delete(s3, bucket, old, dry_run, verbose, done)
         print(f"  old-scheme keys {'to delete' if dry_run else 'deleted'}: {len(old)}")
 
+    done["step"] = "writing archive.json"
     if not dry_run:
         # archive.json: every capture and document with its public URL, and
         # captures.json: each page's stable latest.pdf link.
@@ -287,5 +382,8 @@ if __name__ == "__main__":
     root = Path(os.environ.get("CAM_ARCHIVE_ROOT") or (Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents"
                                                        / "Archive - Changes Around Me/Tooling/Web Archive"))
     cal = Path(os.environ.get("CAM_CALENDARS_REPO") or Path(__file__).resolve().parent.parent / "calendars")
-    sync(root, cal / "docs" / "captures.json", dry_run="--dry-run" in flags, verify="--verify" in flags,
-         purge_old="--purge-old-keys" in flags, prune_deleted="--prune-deleted" in flags)
+    try:
+        sync(root, cal / "docs" / "captures.json", dry_run="--dry-run" in flags, verify="--verify" in flags,
+             purge_old="--purge-old-keys" in flags, prune_deleted="--prune-deleted" in flags, verbose="--verbose" in flags)
+    except SyncStopped as stopped:
+        sys.exit(str(stopped))

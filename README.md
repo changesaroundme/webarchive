@@ -307,6 +307,15 @@ when nothing of that page is left), rewrites `archive.json` without them, and sa
 removed, and never one a live file also maps to. Empty `_to_delete/` only after a
 non-dry run: once the files are gone, nothing maps to their keys any more.
 
+What a sync prints. It says when it starts listing the bucket and what it found, numbers
+the uploads when there are several, and shows a deletion as a count per page followed by
+a running total every 250 objects; `--verbose` lists every key instead. If the bucket
+cannot be reached (the Mac went to sleep, the network dropped) or refuses a request, the
+run stops with three lines: where it stopped, what it had already uploaded or deleted,
+and that running the same command again finishes the job. That is always safe: every run
+lists the bucket first and acts only on what is still different, and `archive.json` is
+rewritten only by a run that gets to the end.
+
 `--purge-old-keys` deletes objects under the first key scheme (September 2026:
 `<stamp> - <title>.pdf` and `attachments/`); it was a one-off after the re-key.
 
@@ -453,6 +462,13 @@ reported, a second run saves nothing new, and a real revision is still caught.
 When the archive folder is reachable it also confirms that no web page sits
 among the saved documents — the state the Nov 2026 viewer bug left behind
 (1,232 of them). Run it after any change to `fetch_files`.
+
+    python3 tests/test_r2sync.py
+
+does the same for the bucket sync, against a pretend bucket: what a run prints
+(counts per page, running totals), that a dropped connection stops it with a short
+message saying how far it got, that running it again finishes the job, and that
+nothing live is ever deleted. Run it after any change to `r2sync.py`.
 
 ## Notes
 

@@ -1678,9 +1678,13 @@ def main():
         return
     if "--sync" in flags:
         import r2sync
-        r2sync.sync(ARCHIVE_ROOT, CALENDARS_REPO / "docs" / "captures.json",
-                    dry_run="--dry-run" in flags, verify="--verify" in flags,
-                    purge_old="--purge-old-keys" in flags, prune_deleted="--prune-deleted" in flags)
+        try:
+            r2sync.sync(ARCHIVE_ROOT, CALENDARS_REPO / "docs" / "captures.json",
+                        dry_run="--dry-run" in flags, verify="--verify" in flags,
+                        purge_old="--purge-old-keys" in flags, prune_deleted="--prune-deleted" in flags,
+                        verbose="--verbose" in flags)
+        except r2sync.SyncStopped as stopped:       # bucket out of reach: a short message, not a traceback
+            sys.exit(str(stopped))
         return
 
     if "--all" in flags or "--due" in flags:
